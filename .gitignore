@@ -1,0 +1,18 @@
+# Ignore sample files/folders
+samples/
+*.zip
+
+# Build outputs
+coordinator_app
+worker_app
+*.o
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Temporary files
+*.log
