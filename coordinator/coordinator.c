@@ -3,12 +3,47 @@
 #include <string.h>     // strlen
 #include <unistd.h>     // close
 #include <arpa/inet.h>  // socket structs and networking functions
+#include <pthread.h>    // thread library for handling multiple workers
 
 #define PORT 5000
 #define BUFFER_SIZE 1024
 
+//this function is the "helper" that handles each worker (this is like handing the call to another person)
+void *handle_worker(void *arg) {
+    int client_fd = *(int *)arg; //get the client socket passed from main thread
+    free(arg); //free memory after grabbing value
+
+    char buffer[BUFFER_SIZE];
+
+    printf("Helper handling worker\n");
+
+    // Read the message sent by the worker
+    int bytes = recv(client_fd, buffer, BUFFER_SIZE - 1, 0); //recv() == you listen / receive data
+    if (bytes > 0) {
+        buffer[bytes] = '\0';   // add string ending character to make sure its printable in C
+        printf("Received: %s\n", buffer);
+    } else if (bytes == 0) {
+        printf("Worker disconnected\n");
+    } else {
+        perror("Receive failed");
+    }
+
+    sleep(5);
+
+    // Send a reply back to the worker
+    const char *response = "Hello from coordinator!"; //changed to const since string should not be modified
+    send(client_fd, response, strlen(response), 0); //send() == you talk back
+
+    // Close this worker connection, but keep server alive (hanging up the phone)
+    close(client_fd); //close() == you hang up
+
+    printf("Helper finished worker\n");
+
+    return NULL;
+}
+
 int main() {
-    int server_fd, client_fd;   // server socket and connected client socket (server_Fd = phone sitting on desk  client_fd = active phone call)
+    int server_fd;   // server socket (server_Fd = phone sitting on desk)
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
 
@@ -45,35 +80,39 @@ int main() {
     // Keep the coordinator running so workers can connect (keeps server alive forever. without this it would only accept one connection and exit)
     while (1) {
 
+        int *client_fd_ptr = malloc(sizeof(int)); //allocate memory so each thread gets its own copy of the socket
+        if (client_fd_ptr == NULL) {
+            perror("Malloc failed");
+            continue;
+        }
+
         // Wait here until a worker connects
-        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len); //accept() = someone calls you
-        if (client_fd < 0) {
+        *client_fd_ptr = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len); //accept() = someone calls you
+        if (*client_fd_ptr < 0) {
             perror("Accept failed");
+            free(client_fd_ptr);
             continue;
         }
 
         //after accept you now have two sockets Server_fd which keeps listening and client_fd which handles this connection 
         //exmaple of this is one phone stays on desk (server_fd) and one phone is in your hand (client_fd)
 
-        printf("Worker connected\n");
+        printf("Worker connected - transferring to helper\n");
 
-        // Read the message sent by the worker
-        int bytes = recv(client_fd, buffer, BUFFER_SIZE - 1, 0); //recv() == you listen / receive data
-        if (bytes > 0) {
-            buffer[bytes] = '\0';   // add string ending character to make sure its priintable in C
-            printf("Received: %s\n", buffer);
-        } else if (bytes == 0) {
-            printf("Worker disconnected\n");
-        } else {
-            perror("Receive failed");
+        pthread_t thread_id;
+
+        //create a new thread (helper) to handle this worker so the main server can go back to answering calls
+        if (pthread_create(&thread_id, NULL, handle_worker, client_fd_ptr) != 0) {
+            perror("Thread creation failed");
+            close(*client_fd_ptr);
+            free(client_fd_ptr);
+            continue;
         }
 
-        // Send a reply back to the worker
-        char *response = "Hello from coordinator!";
-        send(client_fd, response, strlen(response), 0); //send() == you talk back
+        pthread_detach(thread_id); //let thread clean itself up after finishing so we dont have to track it
 
-        // Close this worker connection, but keep server alive (hanging up the phone)
-        close(client_fd); //close() == you hang up
+        //main thread immediately goes back to accept() to wait for the next worker
+        printf("Main ready for next worker\n");
     }
 
     close(server_fd);
