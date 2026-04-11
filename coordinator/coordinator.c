@@ -7,6 +7,12 @@
 
 #define PORT 5000
 #define BUFFER_SIZE 1024
+#define MAX_WORKERS 100
+
+int workers[MAX_WORKERS];
+int worker_count = 0;
+
+pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 //this function is the "helper" that handles each worker (this is like handing the call to another person)
 void *handle_worker(void *arg) {
@@ -28,11 +34,26 @@ void *handle_worker(void *arg) {
         perror("Receive failed");
     }
 
-    sleep(5);
+    sleep(5); //forces each helper to pause for 5 seconds while holding the connection as everything was finishing too fast
 
     // Send a reply back to the worker
     const char *response = "Hello from coordinator!"; //changed to const since string should not be modified
     send(client_fd, response, strlen(response), 0); //send() == you talk back
+
+    pthread_mutex_lock(&workers_mutex);
+
+// find and remove worker
+    for (int i = 0; i < worker_count; i++) {
+        if (workers[i] == client_fd) {
+            workers[i] = workers[worker_count - 1];
+            worker_count--;
+            break;
+        }
+    }
+
+    printf("Worker removed. Total workers: %d\n", worker_count);
+
+    pthread_mutex_unlock(&workers_mutex);
 
     // Close this worker connection, but keep server alive (hanging up the phone)
     close(client_fd); //close() == you hang up
@@ -94,6 +115,15 @@ int main() {
             continue;
         }
 
+        pthread_mutex_lock(&workers_mutex);
+        if (worker_count < MAX_WORKERS) {
+            workers[worker_count++] = *client_fd_ptr;
+            printf("Worker added. Total workers: %d\n", worker_count);
+        }
+
+        pthread_mutex_unlock(&workers_mutex);
+
+
         //after accept you now have two sockets Server_fd which keeps listening and client_fd which handles this connection 
         //exmaple of this is one phone stays on desk (server_fd) and one phone is in your hand (client_fd)
 
@@ -103,11 +133,22 @@ int main() {
 
         //create a new thread (helper) to handle this worker so the main server can go back to answering calls
         if (pthread_create(&thread_id, NULL, handle_worker, client_fd_ptr) != 0) {
-            perror("Thread creation failed");
-            close(*client_fd_ptr);
-            free(client_fd_ptr);
-            continue;
+        perror("Thread creation failed");
+
+        pthread_mutex_lock(&workers_mutex);
+        for (int i = 0; i < worker_count; i++) {
+            if (workers[i] == *client_fd_ptr) {
+                workers[i] = workers[worker_count - 1];
+                worker_count--;
+                break;
+            }
         }
+        pthread_mutex_unlock(&workers_mutex);
+
+        close(*client_fd_ptr);
+        free(client_fd_ptr);
+        continue;
+    }
 
         pthread_detach(thread_id); //let thread clean itself up after finishing so we dont have to track it
 
