@@ -37,6 +37,7 @@ serves in your app.
 ### Installation Steps
 - sudo apt install git
 - sudo apt install gcc
+- sudo apt install libcjson-dev
 - git clone https://github.com/remocom/compiler.git
 - make
 - cd compiler
