@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
-#include "../common/common.h"
 
 #define PORT 5000
 #define BUFFER_SIZE 1024
