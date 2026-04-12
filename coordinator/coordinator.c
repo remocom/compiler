@@ -4,6 +4,7 @@
 #include <unistd.h>     // close
 #include <arpa/inet.h>  // socket structs and networking functions
 #include <pthread.h>    // thread library for handling multiple workers
+#include <cjson/cJSON.h> // Ultra lightweight JSON parser library
 
 #define PORT 5000
 #define BUFFER_SIZE 1024
@@ -31,20 +32,46 @@ void *handle_worker(void *arg) {
 
     printf("Helper handling worker\n");
 
-    // Read the message sent by the worker
+    // Read the JSON message sent by the worker and parse 
     int bytes = recv(client_fd, buffer, BUFFER_SIZE - 1, 0); //recv() == you listen / receive data
     if (bytes > 0) {
         buffer[bytes] = '\0';   // add string ending character to make sure its printable in C
-        printf("Received: %s\n", buffer);
+        cJSON *msg = cJSON_Parse(buffer);
+        if(msg == NULL){
+            printf("Invalid JSON received\n");
+            pthread_mutex_lock(&log_mutex);
+            fprintf(log_file, "[WARNING] Invalid JSON received\n");
+            fflush(log_file);
+            pthread_mutex_unlock(&log_mutex);
+            close(client_fd);
+            return NULL;
+        }
+        
+        cJSON *type = cJSON_GetObjectItem(msg, "type");
+        cJSON *payload = cJSON_GetObjectItem(msg, "payload");
+        if(type == NULL || payload == NULL){
+            printf("Missing fields in JSON\n");
+            pthread_mutex_lock(&log_mutex);
+            fprintf(log_file, "[WARNING] Missing fields in JSON message\n");
+            fflush(log_file);
+            pthread_mutex_unlock(&log_mutex);
+            cJSON_Delete(msg);
+            close(client_fd);
+            return NULL;
+
+        }
+        printf("Received Type: %s | Payload: %s\n", type->valuestring, payload->valuestring);
         for (int i = 0; i < worker_count; i++) {
             if (workers[i].socketID == client_fd) {
                 pthread_mutex_lock(&log_mutex);
-                fprintf(log_file, "MESSAGE RECEIVED by Node %d: %s\n", workers[i].nodeID, buffer);
-                pthread_mutex_unlock(&log_mutex);
+                fprintf(log_file, "MESSAGE RECEIVED by Node %d | Type: %s | Payload: %s\n",
+                    workers[i].nodeID, type->valuestring, payload->valuestring);
                 fflush(log_file);
+                pthread_mutex_unlock(&log_mutex);
                 break;
             }
-        }    
+        }
+        cJSON_Delete(msg);
     } else if (bytes == 0) {
         printf("Worker disconnected\n");
     } else {
@@ -89,8 +116,6 @@ int main() {
     int server_fd;   // server socket (server_Fd = phone sitting on desk)
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
-
-    char buffer[BUFFER_SIZE];
 
     log_file = fopen("coordinator.log", "a");
     if(log_file == NULL){
