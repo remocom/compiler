@@ -1,12 +1,12 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g -pthread
 
-all: coordinator worker
+all: coordinatorMake workerMake
 
-coordinator: coordinator/coordinator.c
+coordinatorMake: coordinator/coordinator.c
 	$(CC) $(CFLAGS) -o coordinator_app coordinator/coordinator.c
 
-worker: worker/worker.c
+workerMake: worker/worker.c
 	$(CC) $(CFLAGS) -o worker_app worker/worker.c
 
 clean:

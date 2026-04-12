@@ -9,10 +9,18 @@
 #define BUFFER_SIZE 1024
 #define MAX_WORKERS 100
 
-int workers[MAX_WORKERS];
+typedef struct {
+    int nodeID;
+    int socketID;
+    char ip_address[INET_ADDRSTRLEN];
+} Node;
+
+Node workers[MAX_WORKERS];
 int worker_count = 0;
+FILE *log_file;
 
 pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 //this function is the "helper" that handles each worker (this is like handing the call to another person)
 void *handle_worker(void *arg) {
@@ -28,6 +36,15 @@ void *handle_worker(void *arg) {
     if (bytes > 0) {
         buffer[bytes] = '\0';   // add string ending character to make sure its printable in C
         printf("Received: %s\n", buffer);
+        for (int i = 0; i < worker_count; i++) {
+            if (workers[i].socketID == client_fd) {
+                pthread_mutex_lock(&log_mutex);
+                fprintf(log_file, "MESSAGE RECEIVED by Node %d: %s\n", workers[i].nodeID, buffer);
+                pthread_mutex_unlock(&log_mutex);
+                fflush(log_file);
+                break;
+            }
+        }    
     } else if (bytes == 0) {
         printf("Worker disconnected\n");
     } else {
@@ -44,7 +61,12 @@ void *handle_worker(void *arg) {
 
 // find and remove worker
     for (int i = 0; i < worker_count; i++) {
-        if (workers[i] == client_fd) {
+        if (workers[i].socketID == client_fd) {
+            pthread_mutex_lock(&log_mutex);
+            fprintf(log_file, "DISCONNECT Node %d | IP: %s | Socket: %d\n", workers[i].nodeID, 
+                workers[i].ip_address, workers[i].socketID);
+            fflush(log_file);
+            pthread_mutex_unlock(&log_mutex);
             workers[i] = workers[worker_count - 1];
             worker_count--;
             break;
@@ -69,6 +91,12 @@ int main() {
     socklen_t addr_len = sizeof(client_addr);
 
     char buffer[BUFFER_SIZE];
+
+    log_file = fopen("coordinator.log", "a");
+    if(log_file == NULL){
+        perror("Failed to open log file");
+        exit(1);
+    }
 
     // Create a TCP socket for the coordinator
     server_fd = socket(AF_INET, SOCK_STREAM, 0); //this creates the server or "phone" by using AF_INET (IPv4) and Sock_Stream (TCP)
@@ -117,8 +145,17 @@ int main() {
 
         pthread_mutex_lock(&workers_mutex);
         if (worker_count < MAX_WORKERS) {
-            workers[worker_count++] = *client_fd_ptr;
-            printf("Worker added. Total workers: %d\n", worker_count);
+            workers[worker_count].socketID = *client_fd_ptr;
+            workers[worker_count].nodeID = worker_count;
+            printf("Worker added. Total workers: %d\n", worker_count+1);
+            /*Convert raw bytes to readable IP address*/
+            inet_ntop(AF_INET, &client_addr.sin_addr, workers[worker_count].ip_address, INET_ADDRSTRLEN);
+            pthread_mutex_lock(&log_mutex);
+            fprintf(log_file, "CONNECT Node %d | IP: %s | Socket: %d\n", workers[worker_count].nodeID, 
+                                    workers[worker_count].ip_address, workers[worker_count].socketID);
+            fflush(log_file);
+            pthread_mutex_unlock(&log_mutex);
+            worker_count++;
         }
 
         pthread_mutex_unlock(&workers_mutex);
@@ -133,22 +170,26 @@ int main() {
 
         //create a new thread (helper) to handle this worker so the main server can go back to answering calls
         if (pthread_create(&thread_id, NULL, handle_worker, client_fd_ptr) != 0) {
-        perror("Thread creation failed");
+            perror("Thread creation failed");
 
-        pthread_mutex_lock(&workers_mutex);
-        for (int i = 0; i < worker_count; i++) {
-            if (workers[i] == *client_fd_ptr) {
-                workers[i] = workers[worker_count - 1];
-                worker_count--;
-                break;
+            pthread_mutex_lock(&workers_mutex);
+            for (int i = 0; i < worker_count; i++) {
+                if (workers[i].socketID == *client_fd_ptr) {
+                    pthread_mutex_lock(&log_mutex);
+                    fprintf(log_file, "[ERROR] Failed to connect Node %d to thread.\n", workers[i].nodeID);
+                    fflush(log_file);
+                    pthread_mutex_unlock(&log_mutex);
+                    workers[i] = workers[worker_count - 1];
+                    worker_count--;
+                    break;
+                }
             }
-        }
-        pthread_mutex_unlock(&workers_mutex);
+            pthread_mutex_unlock(&workers_mutex);
 
-        close(*client_fd_ptr);
-        free(client_fd_ptr);
-        continue;
-    }
+            close(*client_fd_ptr);
+            free(client_fd_ptr);
+            continue;
+        }
 
         pthread_detach(thread_id); //let thread clean itself up after finishing so we dont have to track it
 
