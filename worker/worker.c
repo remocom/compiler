@@ -43,6 +43,25 @@ int main() {
         buffer[bytes] = '\0';
         printf("Received from coordinator: %s\n", buffer);
     }
+    
+    //Task Request Logic: After registering with the coordinator, the worker sends a "task_request"
+    //message to request work. It then waits for a response from the coordinator,
+    //which will either be a task assignment or a no-task message.
+
+    cJSON *task_request = cJSON_CreateObject(); //makes a new empty JSON object in memory ({})
+    cJSON_AddStringToObject(task_request, "type", "task_request"); // { "type": "task_request"} 
+    cJSON_AddStringToObject(task_request, "payload", "requesting work"); // { "type": "task_request", "payload": "requesting work"} 
+    char *task_string = cJSON_Print(task_request); //turns JSON object into actual string so it can be sent through the socket
+    send(sock_fd, task_string, strlen(task_string), 0); //sends now JSON string over socket to coordinator
+    cJSON_Delete(task_request); //frees JSON object memory
+    free(task_string); //frees memory created by CJSON_Print()
+
+    bytes = recv(sock_fd, buffer, BUFFER_SIZE - 1, 0); //waits for coordinator to send something back
+    if (bytes > 0) {
+        buffer[bytes] = '\0'; //adds null term
+        printf("Task response from coordinator: %s\n", buffer); // coordinator response
+    }
+    
     while(1){
         sleep(5); // every 5 seconds send heartbeat
         cJSON *heartbeat = cJSON_CreateObject();

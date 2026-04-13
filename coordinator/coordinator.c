@@ -10,6 +10,7 @@
 #define PORT 5000
 #define BUFFER_SIZE 1024
 #define MAX_WORKERS 100
+#define MAX_TASKS 10
 
 typedef struct {
     int nodeID;
@@ -23,8 +24,18 @@ Node workers[MAX_WORKERS];
 int worker_count = 0;
 FILE *log_file;
 
+char *task_queue[MAX_TASKS] = { //list of tasks the coordinator can hand out (tasks still need to be implemented)
+    "compile main.c",
+    "compile util.c",
+    "compile helper.c"
+};
+
+int total_tasks = 3; //right now total_tasks is set to 3 
+int next_task_index = 0; 
+
 pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER; 
+pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER; 
 
 /*
  * this function monitors each worker's heartbeat every ten seconds
@@ -48,6 +59,18 @@ void *monitor_workers(void *arg){
         pthread_mutex_unlock(&workers_mutex);
     }
     return NULL;
+}
+
+void send_json_message(int client_fd, const char *type_str, const char *payload_str) { //helper that builds a JSON message and sends it to worker
+    cJSON *msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "type", type_str);
+    cJSON_AddStringToObject(msg, "payload", payload_str);
+
+    char *json_string = cJSON_PrintUnformatted(msg);
+    send(client_fd, json_string, strlen(json_string), 0);
+
+    free(json_string);
+    cJSON_Delete(msg);
 }
 
 // this function is the "helper" that handles each worker (this is like handing the call to another person)
@@ -115,10 +138,35 @@ void *handle_worker(void *arg) {
                     workers[i].last_heartbeat = time(NULL); // update with latest 
                     pthread_mutex_unlock(&workers_mutex);
                 } 
+                else if(strcmp(type->valuestring, "register") == 0){
+                    send_json_message(client_fd, "ack", "Worker registered");
+                }
+                else if(strcmp(type->valuestring, "task_request") == 0){
+
+                    pthread_mutex_lock(&task_mutex);
+
+                    if(next_task_index < total_tasks){
+                        char *task = task_queue[next_task_index];
+                        next_task_index++;
+
+                        pthread_mutex_unlock(&task_mutex);
+
+                        send_json_message(client_fd, "task_assignment", task);
+
+                        pthread_mutex_lock(&log_mutex);
+                        fprintf(log_file, "TASK ASSIGNED | Node %d | Task: %s\n",
+                                workers[i].nodeID, task);
+                        fflush(log_file);
+                        pthread_mutex_unlock(&log_mutex);
+                    }
+                    else{
+                        pthread_mutex_unlock(&task_mutex);
+
+                        send_json_message(client_fd, "no_task", "No tasks available");
+                    }
+                }
                 else{
-                    // Send a reply back to the worker
-                    const char *response = "Hello from coordinator!"; //changed to const since string should not be modified
-                    send(client_fd, response, strlen(response), 0); //send() == you talk back
+                    send_json_message(client_fd, "unknown", "Unknown message type");
                 }
                 break;
             }
@@ -137,7 +185,7 @@ void *handle_worker(void *arg) {
 
     pthread_mutex_lock(&workers_mutex);
 
-// find and remove worker
+    // find and remove worker
     for (int i = 0; i < worker_count; i++) {
         if (workers[i].socketID == client_fd) {
             pthread_mutex_lock(&log_mutex);
@@ -246,7 +294,6 @@ int main() {
         }
 
         pthread_mutex_unlock(&workers_mutex);
-
 
         //after accept you now have two sockets Server_fd which keeps listening and client_fd which handles this connection 
         //exmaple of this is one phone stays on desk (server_fd) and one phone is in your hand (client_fd)
