@@ -5,6 +5,7 @@
 #include <arpa/inet.h>  // socket structs and networking functions
 #include <pthread.h>    // thread library for handling multiple workers
 #include <cjson/cJSON.h> // Ultra lightweight JSON parser library
+#include <time.h>
 
 #define PORT 5000
 #define BUFFER_SIZE 1024
@@ -14,6 +15,8 @@ typedef struct {
     int nodeID;
     int socketID;
     char ip_address[INET_ADDRSTRLEN];
+    time_t last_heartbeat; // timestamp
+    int dead; // 0 = alive, 1 = dead.
 } Node;
 
 Node workers[MAX_WORKERS];
@@ -23,8 +26,33 @@ FILE *log_file;
 pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-//this function is the "helper" that handles each worker (this is like handing the call to another person)
+/*
+ * this function monitors each worker's heartbeat every ten seconds
+ * and remove a node that hasn't pulsed for 15 seconds or longer.
+*/
+void *monitor_workers(void *arg){
+    while(1){
+        sleep(10);
+        time_t now = time(NULL);
+        pthread_mutex_lock(&workers_mutex);
+        for(int i = 0; i < worker_count; i++){
+            if(now - workers[i].last_heartbeat > 15 && workers[i].dead != 1){
+                pthread_mutex_lock(&log_mutex);
+                fprintf(log_file, "[TIMEOUT] Node %d | IP: %s\n", workers[i].nodeID, workers[i].ip_address);
+                fflush(log_file);
+                pthread_mutex_unlock(&log_mutex);
+                workers[i].dead = 1;
+                close(workers[i].socketID);
+            }
+        }
+        pthread_mutex_unlock(&workers_mutex);
+    }
+    return NULL;
+}
+
+// this function is the "helper" that handles each worker (this is like handing the call to another person)
 void *handle_worker(void *arg) {
+    int isDead = 0;
     int client_fd = *(int *)arg; //get the client socket passed from main thread
     free(arg); //free memory after grabbing value
 
@@ -34,7 +62,7 @@ void *handle_worker(void *arg) {
 
     // Read the JSON message sent by the worker and parse 
     int bytes = recv(client_fd, buffer, BUFFER_SIZE - 1, 0); //recv() == you listen / receive data
-    if (bytes > 0) {
+    while (bytes > 0) { // connection stays alive as long as bytes are being read
         buffer[bytes] = '\0';   // add string ending character to make sure its printable in C
         cJSON *msg = cJSON_Parse(buffer);
         if(msg == NULL){
@@ -60,29 +88,52 @@ void *handle_worker(void *arg) {
             return NULL;
 
         }
-        printf("Received Type: %s | Payload: %s\n", type->valuestring, payload->valuestring);
+
         for (int i = 0; i < worker_count; i++) {
             if (workers[i].socketID == client_fd) {
+                if(workers[i].dead == 1){ // if node has no heartbeat, then any lingering payload message in pipeline is handled
+                    printf("Received Type: %s | Payload: %s (node already timed out) \n",
+                        type->valuestring, payload->valuestring);
+                    pthread_mutex_lock(&log_mutex);
+                    fprintf(log_file, "MESSAGE RECEIVED by Node %d | Type: %s | Payload: %s (node already timed out)\n",
+                        workers[i].nodeID, type->valuestring, payload->valuestring);
+                    fflush(log_file);
+                    pthread_mutex_unlock(&log_mutex);
+                    isDead = 1;
+                    break;
+                }
+
+                printf("Received Type: %s | Payload: %s \n", type->valuestring, payload->valuestring);
                 pthread_mutex_lock(&log_mutex);
                 fprintf(log_file, "MESSAGE RECEIVED by Node %d | Type: %s | Payload: %s\n",
                     workers[i].nodeID, type->valuestring, payload->valuestring);
                 fflush(log_file);
                 pthread_mutex_unlock(&log_mutex);
+
+                if(strcmp(type->valuestring, "heartbeat") == 0){
+                    pthread_mutex_lock(&workers_mutex);
+                    workers[i].last_heartbeat = time(NULL); // update with latest 
+                    pthread_mutex_unlock(&workers_mutex);
+                } 
+                else{
+                    // Send a reply back to the worker
+                    const char *response = "Hello from coordinator!"; //changed to const since string should not be modified
+                    send(client_fd, response, strlen(response), 0); //send() == you talk back
+                }
                 break;
             }
         }
         cJSON_Delete(msg);
-    } else if (bytes == 0) {
+        if(isDead){
+            break;
+        }
+        bytes = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+    } 
+    if (bytes == 0) {
         printf("Worker disconnected\n");
-    } else {
-        perror("Receive failed");
+    } else if (!isDead) {
+        perror("Receive failed"); // only print if not a timeout
     }
-
-    sleep(5); //forces each helper to pause for 5 seconds while holding the connection as everything was finishing too fast
-
-    // Send a reply back to the worker
-    const char *response = "Hello from coordinator!"; //changed to const since string should not be modified
-    send(client_fd, response, strlen(response), 0); //send() == you talk back
 
     pthread_mutex_lock(&workers_mutex);
 
@@ -90,8 +141,13 @@ void *handle_worker(void *arg) {
     for (int i = 0; i < worker_count; i++) {
         if (workers[i].socketID == client_fd) {
             pthread_mutex_lock(&log_mutex);
-            fprintf(log_file, "DISCONNECT Node %d | IP: %s | Socket: %d\n", workers[i].nodeID, 
-                workers[i].ip_address, workers[i].socketID);
+            if(workers[i].dead){
+                fprintf(log_file, "REMOVED (timeout) Node %d | IP: %s\n",
+                workers[i].nodeID, workers[i].ip_address);
+            } else{
+                fprintf(log_file, "DISCONNECT Node %d | IP: %s | Socket: %d\n", workers[i].nodeID, 
+                    workers[i].ip_address, workers[i].socketID);
+            }
             fflush(log_file);
             pthread_mutex_unlock(&log_mutex);
             workers[i] = workers[worker_count - 1];
@@ -117,7 +173,7 @@ int main() {
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
 
-    log_file = fopen("coordinator.log", "a");
+    log_file = fopen("coordinator.log", "w");
     if(log_file == NULL){
         perror("Failed to open log file");
         exit(1);
@@ -149,11 +205,15 @@ int main() {
         exit(1);
     }
 
+    // Create thread that will monitor heartbeat status of nodes
+    pthread_t monitor_thread;
+    pthread_create(&monitor_thread, NULL, monitor_workers, NULL);
+    pthread_detach(monitor_thread);
+
     printf("Coordinator listening on port %d...\n", PORT);
 
     // Keep the coordinator running so workers can connect (keeps server alive forever. without this it would only accept one connection and exit)
     while (1) {
-
         int *client_fd_ptr = malloc(sizeof(int)); //allocate memory so each thread gets its own copy of the socket
         if (client_fd_ptr == NULL) {
             perror("Malloc failed");
@@ -172,6 +232,8 @@ int main() {
         if (worker_count < MAX_WORKERS) {
             workers[worker_count].socketID = *client_fd_ptr;
             workers[worker_count].nodeID = worker_count;
+            workers[worker_count].last_heartbeat = time(NULL);
+            workers[worker_count].dead = 0;
             printf("Worker added. Total workers: %d\n", worker_count+1);
             /*Convert raw bytes to readable IP address*/
             inet_ntop(AF_INET, &client_addr.sin_addr, workers[worker_count].ip_address, INET_ADDRSTRLEN);

@@ -43,6 +43,22 @@ int main() {
         buffer[bytes] = '\0';
         printf("Received from coordinator: %s\n", buffer);
     }
+    while(1){
+        sleep(5); // every 5 seconds send heartbeat
+        cJSON *heartbeat = cJSON_CreateObject();
+        cJSON_AddStringToObject(heartbeat, "type", "heartbeat");
+        cJSON_AddStringToObject(heartbeat, "payload", "alive");
+        char *hb_string = cJSON_Print(heartbeat);
+        int result = send(sock_fd, hb_string, strlen(hb_string), 0);
+        cJSON_Delete(heartbeat);
+        free(hb_string);
+        
+        if(result < 0){
+            printf("Coordinator disconnected\n");
+            break;
+        }
+        printf("Heartbeat sent\n");
+    }
 
     close(sock_fd);
     return 0;
