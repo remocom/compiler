@@ -51,19 +51,19 @@ void *monitor_workers(void *arg){
 
         // Loop through all live workers and check for timeouts.
         for(int i = 0; i < worker_count; i++){
-            Node worker = workers[i];
-            int time_since_heartbeat = current_time - worker.last_heartbeat;
+            Node *worker = &workers[i];
+            int time_since_heartbeat = current_time - worker->last_heartbeat;
 
-            if(time_since_heartbeat > 15 && worker.status != dead){
+            if(time_since_heartbeat > 15 && worker->status != dead){
                 // Log the timeout event.
                 pthread_mutex_lock(&log_mutex); // Lock log file for writing.
-                fprintf(log_file, "[TIMEOUT] Node %d | IP: %s\n", worker.nodeID, worker.ip_address);
+                fprintf(log_file, "[TIMEOUT] Node %d | IP: %s\n", worker->nodeID, worker->ip_address);
                 fflush(log_file);
                 pthread_mutex_unlock(&log_mutex); // Unlock log file.
 
                 // Mark the worker as dead and close its socket.
-                worker.status = dead;
-                close(worker.socketID);
+                worker->status = dead;
+                close(worker->socketID);
             }
         }
         
