@@ -12,12 +12,16 @@
 #define MAX_WORKERS 100
 #define MAX_TASKS 10
 
+/// @brief Represents the status of a worker node, which can be either dead or alive.
+typedef enum { dead, alive } NodeStatus;
+
+/// @brief Represents a worker node in the system, containing its ID, socket, IP address, last heartbeat timestamp, and status (alive or dead).
 typedef struct {
     int nodeID;
     int socketID;
     char ip_address[INET_ADDRSTRLEN];
     time_t last_heartbeat; // timestamp
-    int dead; // 0 = alive, 1 = dead.
+    NodeStatus status; // alive or dead
 } Node;
 
 Node workers[MAX_WORKERS];
@@ -37,26 +41,33 @@ pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER; 
 pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER; 
 
-/*
- * this function monitors each worker's heartbeat every ten seconds
- * and remove a node that hasn't pulsed for 15 seconds or longer.
-*/
+/// @brief Checks in with live worker nodes every 10 seconds, marking them as dead if they haven't sent a heartbeat within the last 15 seconds and logging timeouts.
 void *monitor_workers(void *arg){
     while(1){
         sleep(10);
-        time_t now = time(NULL);
-        pthread_mutex_lock(&workers_mutex);
+        time_t current_time = time(NULL);
+        
+        pthread_mutex_lock(&workers_mutex); // Lock worker list.
+
+        // Loop through all live workers and check for timeouts.
         for(int i = 0; i < worker_count; i++){
-            if(now - workers[i].last_heartbeat > 15 && workers[i].dead != 1){
-                pthread_mutex_lock(&log_mutex);
-                fprintf(log_file, "[TIMEOUT] Node %d | IP: %s\n", workers[i].nodeID, workers[i].ip_address);
+            Node worker = workers[i];
+            int time_since_heartbeat = current_time - worker.last_heartbeat;
+
+            if(time_since_heartbeat > 15 && worker.status != dead){
+                // Log the timeout event.
+                pthread_mutex_lock(&log_mutex); // Lock log file for writing.
+                fprintf(log_file, "[TIMEOUT] Node %d | IP: %s\n", worker.nodeID, worker.ip_address);
                 fflush(log_file);
-                pthread_mutex_unlock(&log_mutex);
-                workers[i].dead = 1;
-                close(workers[i].socketID);
+                pthread_mutex_unlock(&log_mutex); // Unlock log file.
+
+                // Mark the worker as dead and close its socket.
+                worker.status = dead;
+                close(worker.socketID);
             }
         }
-        pthread_mutex_unlock(&workers_mutex);
+        
+        pthread_mutex_unlock(&workers_mutex); // Unlock worker list.
     }
     return NULL;
 }
