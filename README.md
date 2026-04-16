@@ -72,7 +72,15 @@ sources = ["main.c", "common/common.c"]
 
 4) Workers request compilation tasks from the coordinator, run GCC with the manifest-provided flags, and report task results back to the coordinator.
 
-## Known Problems
+### 4 Themes Used
+- Network Programming 
+- Remote Procedure Calls
+- Distributed Systems
+- Running Programs / Linking
+
+### Design Decisions/Trade-Offs 
+
+## Known Problems / Lessons Learned
 TODO: Describe any known issues, bugs, odd behaviors or code smells.
 Provide steps to reproduce the problem and/or name a file or a function where the
 problem lives.
