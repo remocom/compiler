@@ -7,6 +7,7 @@
 #include <cjson/cJSON.h> // Ultra lightweight JSON parser library
 #include <time.h>
 #include <stdarg.h>
+#include "../common/common.h"
 
 #define PORT 5000
 #define BUFFER_SIZE 1024
@@ -23,6 +24,7 @@ typedef struct {
     char ip_address[INET_ADDRSTRLEN];
     time_t last_heartbeat; // timestamp
     NodeStatus status; // alive or dead
+    int handshake_completed;
 } Node;
 
 Node workers[MAX_WORKERS];
@@ -44,6 +46,60 @@ pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void send_json_message(int client_fd, const char *type_str, const char *payload_str);
 void *handle_worker(void *arg);
+
+/// @brief Validates and applies handshake payload for a worker.
+/// @param worker Worker record to update if handshake is accepted.
+/// @param payload Parsed payload object from incoming message.
+/// @param reason_buf Output buffer for mismatch reason.
+/// @param reason_buf_len Size of reason buffer.
+/// @return 1 if payload matches coordinator requirements, 0 otherwise.
+static int validate_handshake_payload(Node *worker, cJSON *payload, char *reason_buf, size_t reason_buf_len) {
+    if (payload == NULL || !cJSON_IsObject(payload)) {
+        snprintf(reason_buf, reason_buf_len, "Handshake payload must be an object");
+        return 0;
+    }
+
+    cJSON *gcc_version = cJSON_GetObjectItem(payload, HANDSHAKE_KEY_GCC_VERSION);
+    cJSON *target_arch = cJSON_GetObjectItem(payload, HANDSHAKE_KEY_TARGET_ARCH);
+    cJSON *target_os = cJSON_GetObjectItem(payload, HANDSHAKE_KEY_TARGET_OS);
+    cJSON *rpc_protocol_version = cJSON_GetObjectItem(payload, HANDSHAKE_KEY_RPC_PROTOCOL_VERSION);
+
+    if (!cJSON_IsString(gcc_version) || !cJSON_IsString(target_arch) ||
+        !cJSON_IsString(target_os) || !cJSON_IsNumber(rpc_protocol_version)) {
+        snprintf(reason_buf, reason_buf_len, "Handshake payload missing required fields");
+        return 0;
+    }
+
+    if (strcmp(gcc_version->valuestring, __VERSION__) != 0) {
+        snprintf(reason_buf, reason_buf_len, "GCC mismatch worker=%s coordinator=%s",
+            gcc_version->valuestring, __VERSION__);
+        return 0;
+    }
+
+    const char *expected_arch = remocom_detect_target_arch();
+    if (strcmp(target_arch->valuestring, expected_arch) != 0) {
+        snprintf(reason_buf, reason_buf_len, "Architecture mismatch worker=%s coordinator=%s",
+            target_arch->valuestring, expected_arch);
+        return 0;
+    }
+
+    const char *expected_os = remocom_detect_target_os();
+    if (strcmp(target_os->valuestring, expected_os) != 0) {
+        snprintf(reason_buf, reason_buf_len, "OS mismatch worker=%s coordinator=%s",
+            target_os->valuestring, expected_os);
+        return 0;
+    }
+
+    int worker_protocol_version = rpc_protocol_version->valueint;
+    if (worker_protocol_version != REMOCOM_RPC_PROTOCOL_VERSION) {
+        snprintf(reason_buf, reason_buf_len, "RPC protocol version mismatch worker=%d coordinator=%d",
+            worker_protocol_version, REMOCOM_RPC_PROTOCOL_VERSION);
+        return 0;
+    }
+
+    worker->handshake_completed = 1;
+    return 1;
+}
 
 /// @brief Thread-safe logging helper for coordinator events.
 /// @param format printf-style format string.
@@ -111,6 +167,7 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
 
     int node_id = worker->nodeID;
     NodeStatus status = worker->status;
+    int handshake_completed = worker->handshake_completed;
 
     if (status == dead) {
         pthread_mutex_unlock(&workers_mutex);
@@ -124,9 +181,39 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
         return;
     }
 
-    printf("Received Type: %s | Payload: %s \n", type->valuestring, payload->valuestring);
+    char *payload_str = cJSON_PrintUnformatted(payload);
+    if (payload_str == NULL) {
+        payload_str = strdup("<unprintable>");
+    }
+
+    printf("Received Type: %s | Payload: %s \n", type->valuestring, payload_str);
     log_event("MESSAGE RECEIVED by Node %d | Type: %s | Payload: %s\n",
-        node_id, type->valuestring, payload->valuestring);
+        node_id, type->valuestring, payload_str);
+
+    free(payload_str);
+
+    if (strcmp(type->valuestring, MSG_TYPE_HANDSHAKE) == 0) {
+        char mismatch_reason[256];
+        int handshake_ok = validate_handshake_payload(worker, payload, mismatch_reason, sizeof(mismatch_reason));
+        pthread_mutex_unlock(&workers_mutex);
+
+        if (handshake_ok) {
+            send_json_message(client_fd, MSG_TYPE_HANDSHAKE_ACK, "Handshake accepted");
+            log_event("HANDSHAKE ACCEPTED Node %d\n", node_id);
+            return;
+        }
+
+        send_json_message(client_fd, MSG_TYPE_HANDSHAKE_REJECT, mismatch_reason);
+        log_event("HANDSHAKE REJECTED Node %d | Reason: %s\n", node_id, mismatch_reason);
+        *is_dead = 1;
+        return;
+    }
+
+    if (!handshake_completed) {
+        pthread_mutex_unlock(&workers_mutex);
+        send_json_message(client_fd, MSG_TYPE_HANDSHAKE_REQUIRED, "Handshake required before registration");
+        return;
+    }
 
     // Handle heartbeat immediately to keep worker alive in the system.
     if (strcmp(type->valuestring, "heartbeat") == 0) {
@@ -197,6 +284,7 @@ static int register_worker(int client_fd, const struct sockaddr_in *client_addr)
     worker->nodeID = worker_count;
     worker->last_heartbeat = time(NULL);
     worker->status = alive;
+    worker->handshake_completed = 0;
 
     // Convert the client's IP address to a string and store it in the worker struct.
     inet_ntop(AF_INET, &client_addr->sin_addr, worker->ip_address, INET_ADDRSTRLEN);
@@ -351,7 +439,7 @@ void *handle_worker(void *arg) {
         cJSON *payload = cJSON_GetObjectItem(msg, "payload");
 
         // Make sure message has the required fields in string form.
-        if (type == NULL || payload == NULL || !cJSON_IsString(type) || !cJSON_IsString(payload)) {
+        if (type == NULL || payload == NULL || !cJSON_IsString(type)) {
             printf("Missing fields in JSON\n");
             log_event("[WARNING] Missing fields in JSON message\n");
             cJSON_Delete(msg);

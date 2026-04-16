@@ -16,9 +16,11 @@ A remote compiler that seeks to reduce program compilation time by coordinating 
    - The amount of time it would take for the node to transfer a file
    - How many jobs are already queued and their expected completion times
    - A reliability metric
-3) When joining the compilation network, nodes engage in a handshake with the coordinator to ensure that they’re capable of compiling the file in such a way that it could be integrated within the larger solution. During this handshake process, the compiler confirmes:
-    - Architecture
-    - Compiler version
+3) When joining the compilation network, nodes engage in a handshake with the coordinator to ensure that they’re capable of compiling the file in such a way that it could be integrated within the larger solution. During this handshake process, the compiler confirms:
+   - Architecture
+   - Compiler version
+   - Operating system
+   - RPC protocol version
 4) The remote compiler has a command-line interface and uses remote procedure calls to conduct jobs such as:
    - File discovery
    - Compilation
