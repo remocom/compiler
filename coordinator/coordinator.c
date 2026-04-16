@@ -8,11 +8,14 @@
 #include <time.h>
 #include <stdarg.h>
 #include "../common/common.h"
+#include "manifest_loader.h"
 
 #define PORT 5000
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
 #define MAX_WORKERS 100
-#define MAX_TASKS 10
+#define MAX_TASKS REMOCOM_MAX_SOURCES
+#define MAX_MANIFEST_VALUE REMOCOM_MAX_MANIFEST_VALUE
+#define MAX_FLAGS REMOCOM_MAX_FLAGS
 
 /// @brief Represents the status of a worker node, which can be either dead or alive.
 typedef enum { dead, alive } NodeStatus;
@@ -27,25 +30,128 @@ typedef struct {
     int handshake_completed;
 } Node;
 
-Node workers[MAX_WORKERS];
-int worker_count = 0;
-FILE *log_file;
+/// @brief Represents a compile task derived from the manifest, containing source/object paths, build output, and flags.
+typedef struct {
+    char source_path[MAX_MANIFEST_VALUE];
+    char object_path[MAX_MANIFEST_VALUE];
+    char build_output[MAX_MANIFEST_VALUE];
+    char flags[MAX_FLAGS][MAX_MANIFEST_VALUE];
+    int flag_count;
+} CompileTask;
 
-char *task_queue[MAX_TASKS] = { //list of tasks the coordinator can hand out (tasks still need to be implemented)
-    "compile main.c",
-    "compile util.c",
-    "compile helper.c"
-};
+static Node workers[MAX_WORKERS];
+static int worker_count = 0;
+static FILE *log_file;
 
-int total_tasks = 3; //right now total_tasks is set to 3 
-int next_task_index = 0; 
+static CompileTask task_queue[MAX_TASKS];
+static int total_tasks = 0;
+static int next_task_index = 0;
+static BuildManifest build_manifest;
 
-pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER; 
-pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER; 
+static pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void send_json_message(int client_fd, const char *type_str, const char *payload_str);
-void *handle_worker(void *arg);
+static void send_json_with_payload(int client_fd, const char *type_str, cJSON *payload);
+static void send_json_message(int client_fd, const char *type_str, const char *payload_str);
+static void *handle_worker(void *arg);
+
+/// @brief Builds a default object-file path from a source path.
+/// @param source_path Source path from manifest.
+/// @param object_path Destination for derived object path.
+/// @param object_path_size Destination size.
+/// @return 1 on success, 0 if output buffer is too small.
+static int derive_object_path(const char *source_path, char *object_path, size_t object_path_size) {
+    char temp[MAX_MANIFEST_VALUE];
+    snprintf(temp, sizeof(temp), "%s", source_path);
+
+    const char *last_slash = strrchr(temp, '/');
+    char *last_dot = strrchr(temp, '.');
+    if (last_dot != NULL && (last_slash == NULL || last_dot > last_slash)) {
+        *last_dot = '\0';
+    }
+
+    int needed = snprintf(object_path, object_path_size, "%s.o", temp);
+    return needed > 0 && (size_t)needed < object_path_size;
+}
+
+/// @brief Loads a subset of TOML manifest format for the [build] section.
+/// @param manifest_path Path to manifest file.
+/// @param manifest Parsed output manifest.
+/// @param error_buf Destination buffer for validation errors.
+/// @param error_buf_size Size of error buffer.
+/// @return 1 on success, 0 on parse/validation failure.
+static int load_manifest_file(const char *manifest_path, BuildManifest *manifest, char *error_buf, size_t error_buf_size) {
+    return remocom_load_manifest_file(manifest_path, manifest, error_buf, error_buf_size);
+}
+
+/// @brief Converts manifest sources into the coordinator's task queue.
+/// @param manifest Parsed build manifest.
+/// @param error_buf Destination buffer for validation errors.
+/// @param error_buf_size Size of error buffer.
+/// @return 1 on success, 0 when queue/object path validation fails.
+static int build_compile_tasks_from_manifest(const BuildManifest *manifest, char *error_buf, size_t error_buf_size) {
+    total_tasks = 0;
+    next_task_index = 0;
+
+    for (int i = 0; i < manifest->source_count; i++) {
+        if (total_tasks >= MAX_TASKS) {
+            snprintf(error_buf, error_buf_size, "Manifest contains more than %d sources", MAX_TASKS);
+            return 0;
+        }
+
+        CompileTask *task = &task_queue[total_tasks];
+        snprintf(task->source_path, sizeof(task->source_path), "%s", manifest->sources[i]);
+        if (!derive_object_path(task->source_path, task->object_path, sizeof(task->object_path))) {
+            snprintf(error_buf, error_buf_size, "Object path too long for source: %s", task->source_path);
+            return 0;
+        }
+
+        snprintf(task->build_output, sizeof(task->build_output), "%s", manifest->output);
+        task->flag_count = manifest->flag_count;
+        for (int flag_index = 0; flag_index < manifest->flag_count; flag_index++) {
+            snprintf(task->flags[flag_index], sizeof(task->flags[flag_index]), "%s", manifest->flags[flag_index]);
+        }
+
+        total_tasks++;
+    }
+
+    return 1;
+}
+
+/// @brief Prints coordinator usage help.
+/// @param program_name argv[0] executable name.
+static void print_usage(const char *program_name) {
+    printf("Usage: %s --manifest <manifest.toml>\n", program_name);
+    printf("   or: %s -m <manifest.toml>\n", program_name);
+}
+
+/// @brief Parses coordinator CLI args to find manifest path.
+/// @param argc Argument count.
+/// @param argv Argument list.
+/// @param manifest_path Receives parsed manifest path.
+/// @return 1 when CLI args are valid and manifest is provided, 0 otherwise.
+static int parse_manifest_cli_flag(int argc, char **argv, const char **manifest_path) {
+    *manifest_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--manifest") == 0 || strcmp(argv[i], "-m") == 0) {
+            if (i + 1 >= argc) {
+                return 0;
+            }
+
+            *manifest_path = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        } else {
+            return 0;
+        }
+    }
+
+    return *manifest_path != NULL;
+}
 
 /// @brief Validates and applies handshake payload for a worker.
 /// @param worker Worker record to update if handshake is accepted.
@@ -137,17 +243,57 @@ static void assign_task_to_worker(int client_fd, int node_id) {
 
     // Check if there are tasks left to assign.
     if (next_task_index < total_tasks) {
-        char *task = task_queue[next_task_index];
+        CompileTask task = task_queue[next_task_index];
         next_task_index++;
         pthread_mutex_unlock(&task_mutex);
 
-        send_json_message(client_fd, "task_assignment", task);
-        log_event("TASK ASSIGNED | Node %d | Task: %s\n", node_id, task);
+        // Build JSON payload for task assignment message.
+        cJSON *payload = cJSON_CreateObject();
+        cJSON_AddStringToObject(payload, "source", task.source_path);
+        cJSON_AddStringToObject(payload, "object", task.object_path);
+        cJSON_AddStringToObject(payload, "output", task.build_output);
+
+        cJSON *flags = cJSON_AddArrayToObject(payload, "flags");
+        for (int i = 0; i < task.flag_count; i++) {
+            cJSON_AddItemToArray(flags, cJSON_CreateString(task.flags[i]));
+        }
+
+        send_json_with_payload(client_fd, MSG_TYPE_TASK_ASSIGNMENT, payload);
+        log_event("TASK ASSIGNED | Node %d | Source: %s | Object: %s\n",
+            node_id, task.source_path, task.object_path);
         return;
     }
 
     pthread_mutex_unlock(&task_mutex);
-    send_json_message(client_fd, "no_task", "No tasks available");
+    send_json_message(client_fd, MSG_TYPE_NO_TASK, "No tasks available");
+}
+
+/// @brief Logs compile task results reported by workers.
+/// @param node_id Worker node ID.
+/// @param payload Parsed task result payload.
+static void handle_task_result(int node_id, cJSON *payload) {
+    if (!cJSON_IsObject(payload)) {
+        log_event("TASK RESULT | Node %d | Invalid payload\n", node_id);
+        return;
+    }
+
+    // Extract fields from payload with validation.
+    // If any field is missing or of the wrong type, log the issue but attempt to print whatever information is available.
+    cJSON *source = cJSON_GetObjectItem(payload, "source");
+    cJSON *object = cJSON_GetObjectItem(payload, "object");
+    cJSON *status = cJSON_GetObjectItem(payload, "status");
+    cJSON *exit_code = cJSON_GetObjectItem(payload, "exit_code");
+    cJSON *message = cJSON_GetObjectItem(payload, "message");
+
+    log_event(
+        "TASK RESULT | Node %d | source=%s | object=%s | status=%s | exit_code=%d | message=%s\n",
+        node_id,
+        cJSON_IsString(source) ? source->valuestring : "<unknown>",
+        cJSON_IsString(object) ? object->valuestring : "<unknown>",
+        cJSON_IsString(status) ? status->valuestring : "<unknown>",
+        cJSON_IsNumber(exit_code) ? exit_code->valueint : -1,
+        cJSON_IsString(message) ? message->valuestring : "<none>"
+    );
 }
 
 /// @brief Handles a parsed worker message after JSON validation.
@@ -159,7 +305,7 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
     // Look up this worker under lock so heartbeat/status updates are safe.
     pthread_mutex_lock(&workers_mutex);
     Node *worker = find_worker_by_socket_unlocked(client_fd);
-    
+
     if (worker == NULL) {
         pthread_mutex_unlock(&workers_mutex);
         return;
@@ -169,27 +315,26 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
     NodeStatus status = worker->status;
     int handshake_completed = worker->handshake_completed;
 
-    if (status == dead) {
-        pthread_mutex_unlock(&workers_mutex);
-
-        printf("Received Type: %s | Payload: %s (node already timed out) \n",
-            type->valuestring, payload->valuestring);
-        log_event("MESSAGE RECEIVED by Node %d | Type: %s | Payload: %s (node already timed out)\n",
-            node_id, type->valuestring, payload->valuestring);
-
-        *is_dead = 1;
-        return;
-    }
-
     char *payload_str = cJSON_PrintUnformatted(payload);
     if (payload_str == NULL) {
         payload_str = strdup("<unprintable>");
     }
 
-    printf("Received Type: %s | Payload: %s \n", type->valuestring, payload_str);
+    if (status == dead) {
+        pthread_mutex_unlock(&workers_mutex);
+
+        printf("Received Type: %s | Payload: %s (node already timed out)\n", type->valuestring, payload_str);
+        log_event("MESSAGE RECEIVED by Node %d | Type: %s | Payload: %s (node already timed out)\n",
+            node_id, type->valuestring, payload_str);
+
+        free(payload_str);
+        *is_dead = 1;
+        return;
+    }
+
+    printf("Received Type: %s | Payload: %s\n", type->valuestring, payload_str);
     log_event("MESSAGE RECEIVED by Node %d | Type: %s | Payload: %s\n",
         node_id, type->valuestring, payload_str);
-
     free(payload_str);
 
     if (strcmp(type->valuestring, MSG_TYPE_HANDSHAKE) == 0) {
@@ -226,11 +371,13 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
 
     // Handle other message types outside the lock.
     if (strcmp(type->valuestring, "register") == 0) {
-        send_json_message(client_fd, "ack", "Worker registered"); // Acknowledge worker registration.
-    } else if (strcmp(type->valuestring, "task_request") == 0) {
-        assign_task_to_worker(client_fd, node_id); // Assign a task to this worker if available.
+        send_json_message(client_fd, "ack", "Worker registered"); // Acknowledge registration.
+    } else if (strcmp(type->valuestring, MSG_TYPE_TASK_REQUEST) == 0) {
+        assign_task_to_worker(client_fd, node_id); // Assign next task or report no-task.
+    } else if (strcmp(type->valuestring, MSG_TYPE_TASK_RESULT) == 0) {
+        handle_task_result(node_id, payload); // Log the task result reported by the worker.
     } else {
-        send_json_message(client_fd, "unknown", "Unknown message type"); // Unknown message type received - log and ignore.
+        send_json_message(client_fd, "unknown", "Unknown message type");
     }
 }
 
@@ -238,7 +385,7 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
 /// @param client_fd Worker socket to remove.
 static void remove_worker_by_socket(int client_fd) {
     pthread_mutex_lock(&workers_mutex);
-    
+
     // Locate the worker.
     for (int i = 0; i < worker_count; i++) {
         Node *worker = &workers[i];
@@ -251,7 +398,7 @@ static void remove_worker_by_socket(int client_fd) {
                 log_event("DISCONNECT Node %d | IP: %s | Socket: %d\n",
                     worker->nodeID, worker->ip_address, worker->socketID);
             }
-            
+
             *worker = workers[worker_count - 1];
             worker_count--;
             break;
@@ -363,44 +510,41 @@ static int create_server_socket(void) {
 }
 
 /// @brief Checks in with live worker nodes every 10 seconds, marking them as dead if they haven't sent a heartbeat within the last 15 seconds and logging timeouts.
-void *monitor_workers(void *arg){
+static void *monitor_workers(void *arg) {
     (void)arg;
 
-    while(1){
+    while (1) {
         sleep(10);
         time_t current_time = time(NULL);
-        
+
         pthread_mutex_lock(&workers_mutex); // Lock worker list.
-
         // Loop through all live workers and check for timeouts.
-        for(int i = 0; i < worker_count; i++){
+        for (int i = 0; i < worker_count; i++) {
             Node *worker = &workers[i];
-            int time_since_heartbeat = current_time - worker->last_heartbeat;
+            int time_since_heartbeat = (int)(current_time - worker->last_heartbeat);
 
-            if(time_since_heartbeat > 15 && worker->status != dead){
+            if (time_since_heartbeat > 15 && worker->status != dead) {
                 // Log the timeout event.
                 log_event("[TIMEOUT] Node %d | IP: %s\n", worker->nodeID, worker->ip_address);
-
                 // Mark the worker as dead and close its socket.
                 worker->status = dead;
                 close(worker->socketID);
             }
         }
-        
         pthread_mutex_unlock(&workers_mutex); // Unlock worker list.
     }
+
     return NULL;
 }
 
-/// @brief Sends a JSON message to a connected worker.
+/// @brief Sends a JSON message to a connected worker with any cJSON payload type.
 /// @param client_fd The socket file descriptor of the worker to send the message to.
 /// @param type_str The type of the JSON message.
-/// @param payload_str The payload of the JSON message.
-void send_json_message(int client_fd, const char *type_str, const char *payload_str) {
-    // Construct the cJSON object.
+/// @param payload The payload object/value for the JSON message.
+static void send_json_with_payload(int client_fd, const char *type_str, cJSON *payload) {
     cJSON *msg = cJSON_CreateObject();
     cJSON_AddStringToObject(msg, "type", type_str);
-    cJSON_AddStringToObject(msg, "payload", payload_str);
+    cJSON_AddItemToObject(msg, "payload", payload);
 
     // Convert the cJSON object to a string and send it to the worker.
     char *json_string = cJSON_PrintUnformatted(msg);
@@ -411,10 +555,19 @@ void send_json_message(int client_fd, const char *type_str, const char *payload_
     cJSON_Delete(msg);
 }
 
+/// @brief Sends a JSON message to a connected worker.
+/// @param client_fd The socket file descriptor of the worker to send the message to.
+/// @param type_str The type of the JSON message.
+/// @param payload_str The payload of the JSON message.
+static void send_json_message(int client_fd, const char *type_str, const char *payload_str) {
+    cJSON *payload = cJSON_CreateString(payload_str != NULL ? payload_str : "");
+    send_json_with_payload(client_fd, type_str, payload);
+}
+
 /// @brief Handles communication with a connected worker node, processing incoming JSON messages, updating worker status based on heartbeats, assigning tasks, and logging events. This function runs in a separate thread for each worker connection.
 /// @param arg A pointer to the client socket file descriptor.
 /// @return NULL when the worker disconnects or an error occurs.
-void *handle_worker(void *arg) {
+static void *handle_worker(void *arg) {
     int is_dead = 0;
     int client_fd = *(int *)arg; //get the client socket passed from main thread
     free(arg); // free memory after grabbing value
@@ -465,24 +618,44 @@ void *handle_worker(void *arg) {
     }
 
     remove_worker_by_socket(client_fd);
-
     close(client_fd);
     printf("Helper finished worker\n");
     return NULL;
 }
 
-/// @brief Initializes the coordinator server, sets up the listening socket, and handles incoming worker connections by spawning a new thread for each worker. It also starts a monitoring thread to check for worker heartbeats and logs all significant events to a log file.
-int main() {
-    int server_fd;   // server socket (server_fd = phone sitting on desk)
+/// @brief Initializes the coordinator server, loads manifest tasks, sets up the listening socket, and handles incoming worker connections by spawning a new thread for each worker. It also starts a monitoring thread to check for worker heartbeats and logs all significant events to a log file.
+int main(int argc, char **argv) {
+    const char *manifest_path = NULL;
+    char manifest_error[256];
+
+    if (!parse_manifest_cli_flag(argc, argv, &manifest_path)) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    if (!load_manifest_file(manifest_path, &build_manifest, manifest_error, sizeof(manifest_error))) {
+        fprintf(stderr, "%s\n", manifest_error);
+        return 1;
+    }
+
+    if (!build_compile_tasks_from_manifest(&build_manifest, manifest_error, sizeof(manifest_error))) {
+        fprintf(stderr, "%s\n", manifest_error);
+        return 1;
+    }
+
+    int server_fd;
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
 
     // Open log file for writing coordinator events and errors.
     log_file = fopen("coordinator.log", "w");
-    if(log_file == NULL){
+    if (log_file == NULL) {
         perror("Failed to open log file");
-        exit(1);
+        return 1;
     }
+
+    log_event("MANIFEST LOADED | output=%s | sources=%d | flags=%d\n",
+        build_manifest.output, build_manifest.source_count, build_manifest.flag_count);
 
     server_fd = create_server_socket();
 
@@ -491,7 +664,8 @@ int main() {
     pthread_create(&monitor_thread, NULL, monitor_workers, NULL);
     pthread_detach(monitor_thread);
 
-    printf("Coordinator listening on port %d...\n", PORT);
+    printf("Coordinator listening on port %d\n", PORT);
+    printf("Loaded %d compile tasks for output '%s'\n", total_tasks, build_manifest.output);
 
     // Keep the coordinator running so workers can connect (keeps server alive forever. without this it would only accept one connection and exit)
     while (1) {
@@ -502,7 +676,7 @@ int main() {
         }
 
         // Wait here until a worker connects
-        *client_fd_ptr = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len); //accept() = someone calls you
+        *client_fd_ptr = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len); //accept() = someone calls you
         if (*client_fd_ptr < 0) {
             perror("Accept failed");
             free(client_fd_ptr);
@@ -517,7 +691,6 @@ int main() {
 
         //after accept you now have two sockets Server_fd which keeps listening and client_fd which handles this connection 
         //exmaple of this is one phone stays on desk (server_fd) and one phone is in your hand (client_fd)
-
         printf("Worker connected - transferring to helper\n");
 
         //create a new thread (helper) to handle this worker so the main server can go back to answering calls
