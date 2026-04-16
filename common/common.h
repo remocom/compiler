@@ -8,6 +8,10 @@
 #define MSG_TYPE_HANDSHAKE_ACK "handshake_ack"
 #define MSG_TYPE_HANDSHAKE_REJECT "handshake_reject"
 #define MSG_TYPE_HANDSHAKE_REQUIRED "handshake_required"
+#define MSG_TYPE_TASK_REQUEST "task_request"
+#define MSG_TYPE_TASK_ASSIGNMENT "task_assignment"
+#define MSG_TYPE_TASK_RESULT "task_result"
+#define MSG_TYPE_NO_TASK "no_task"
 
 #define HANDSHAKE_KEY_GCC_VERSION "gcc_version"
 #define HANDSHAKE_KEY_TARGET_ARCH "target_arch"
