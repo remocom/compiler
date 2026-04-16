@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
+#include "../common/common.h"
 
 #define PORT 5000
 #define BUFFER_SIZE 1024
@@ -56,6 +57,28 @@ static void send_json_message(int sock_fd, const char *type, const char *payload
     free(json_string);   // frees memory created by cJSON_Print()
 }
 
+/// @brief Sends a handshake payload describing worker build/runtime compatibility.
+/// @param sock_fd The file descriptor for the coordinator socket.
+static void send_handshake_message(int sock_fd) {
+    cJSON *msg = cJSON_CreateObject();
+    cJSON *payload = cJSON_CreateObject();
+
+    cJSON_AddStringToObject(msg, "type", MSG_TYPE_HANDSHAKE);
+    cJSON_AddItemToObject(msg, "payload", payload);
+
+    cJSON_AddStringToObject(payload, HANDSHAKE_KEY_GCC_VERSION, __VERSION__);
+    cJSON_AddStringToObject(payload, HANDSHAKE_KEY_TARGET_ARCH, remocom_detect_target_arch());
+    cJSON_AddStringToObject(payload, HANDSHAKE_KEY_TARGET_OS, remocom_detect_target_os());
+    cJSON_AddNumberToObject(payload, HANDSHAKE_KEY_RPC_PROTOCOL_VERSION, REMOCOM_RPC_PROTOCOL_VERSION);
+
+    // Convert JSON object into a string to be sent through the socket.
+    char *json_string = cJSON_PrintUnformatted(msg);
+    send(sock_fd, json_string, strlen(json_string), 0);
+
+    cJSON_Delete(msg);
+    free(json_string);
+}
+
 /// @brief Receives data from the coordinator into a buffer and stores it in the buffer.
 /// @param sock_fd The file descriptor for the coordinator socket.
 /// @param buffer The buffer to receive data into.
@@ -67,6 +90,58 @@ static int receive_into_buffer(int sock_fd, char *buffer) {
         buffer[bytes] = '\0'; // add string ending character so C prints safely
     }
     return bytes;
+}
+
+/// @brief Parses coordinator response type field into output buffer.
+/// @param json_input Raw JSON response from coordinator.
+/// @param out_type Destination buffer for "type" field.
+/// @param out_type_size Destination buffer size.
+/// @return 1 when parse succeeds and type is present, 0 otherwise.
+static int parse_response_type(const char *json_input, char *out_type, size_t out_type_size) {
+    cJSON *msg = cJSON_Parse(json_input);
+    if (msg == NULL) {
+        return 0;
+    }
+
+    cJSON *type = cJSON_GetObjectItem(msg, "type");
+    if (type == NULL || !cJSON_IsString(type)) {
+        cJSON_Delete(msg);
+        return 0;
+    }
+
+    // Copy type string into output buffer with safety checks.
+    strncpy(out_type, type->valuestring, out_type_size - 1);
+    out_type[out_type_size - 1] = '\0'; // Manually null-terminate to ensure safety.
+    cJSON_Delete(msg);
+    return 1;
+}
+
+/// @brief Performs compatibility handshake and returns 1 on success.
+/// @param sock_fd The file descriptor for the coordinator socket.
+/// @param buffer Reusable receive buffer.
+/// @return 1 if handshake accepted, 0 otherwise.
+static int perform_handshake(int sock_fd, char *buffer) {
+    char type_buffer[64];
+
+    send_handshake_message(sock_fd);
+    int bytes = receive_into_buffer(sock_fd, buffer);
+    if (bytes <= 0) {
+        return 0;
+    }
+
+    if (!parse_response_type(buffer, type_buffer, sizeof(type_buffer))) {
+        return 0;
+    }
+
+    // Handshake is successful if coordinator responds with handshake_ack.
+    // Any other response (including handshake_reject) is a failure.
+    if (strcmp(type_buffer, MSG_TYPE_HANDSHAKE_ACK) != 0) {
+        printf("Handshake failed: %s\n", buffer);
+        return 0;
+    }
+
+    printf("Handshake accepted by coordinator\n");
+    return 1;
 }
 
 /// @brief Registers the worker with the coordinator.
@@ -131,8 +206,14 @@ int main() {
 
     // connect() == worker dials coordinator
     connect_to_coordinator(sock_fd);
-
     printf("Connected to coordinator\n");
+
+    // Perform handshake to verify compatibility with coordinator before proceeding.
+    if (!perform_handshake(sock_fd, buffer)) {
+        printf("Unable to join compilation network\n");
+        close(sock_fd);
+        return 1;
+    }
 
     // Register with the coordinator, request a task, and start sending heartbeats in a loop.
     register_with_coordinator(sock_fd, buffer);
