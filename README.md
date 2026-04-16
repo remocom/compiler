@@ -48,7 +48,15 @@ serves in your app.
 TODO: Write usage instructions. Structuring it as a walkthrough can help structure
 this section, and showcase your features.
 
-## Known Problems
+### 4 Themes Used
+- Network Programming 
+- Remote Procedure Calls
+- Distributed Systems
+- Running Programs / Linking
+
+### Design Decisions/Trade-Offs 
+
+## Known Problems / Lessons Learned
 TODO: Describe any known issues, bugs, odd behaviors or code smells.
 Provide steps to reproduce the problem and/or name a file or a function where the
 problem lives.
