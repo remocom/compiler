@@ -3,11 +3,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <cjson/cJSON.h>
 #include "../common/common.h"
 
 #define PORT 5000
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
+#define MAX_TASK_FLAGS 64
 
 /// @brief Creates a new socket for the worker to communicate with the coordinator.
 /// @return The file descriptor for the created socket.
@@ -40,21 +43,29 @@ static void connect_to_coordinator(int sock_fd) {
     }
 }
 
+/// @brief Sends a JSON message with an arbitrary payload to the coordinator.
+/// @param sock_fd The file descriptor for the coordinator socket.
+/// @param type The type of the message.
+/// @param payload The payload object/value to attach.
+static void send_json_with_payload(int sock_fd, const char *type, cJSON *payload) {
+    cJSON *msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "type", type);
+    cJSON_AddItemToObject(msg, "payload", payload);
+
+    char *json_string = cJSON_PrintUnformatted(msg);
+    send(sock_fd, json_string, strlen(json_string), 0);
+
+    cJSON_Delete(msg);
+    free(json_string);
+}
+
 /// @brief Sends a JSON message to the coordinator.
 /// @param sock_fd The file descriptor for the coordinator socket.
 /// @param type The type of the message.
 /// @param payload The payload of the message.
 static void send_json_message(int sock_fd, const char *type, const char *payload) {
-    cJSON *msg = cJSON_CreateObject(); // makes a new empty JSON object in memory ({})
-    cJSON_AddStringToObject(msg, "type", type);       // add "type" field ({type: "some type"})
-    cJSON_AddStringToObject(msg, "payload", payload); // add "payload" field ({type: "some type", payload: "some payload"})
-
-    // turns JSON object into actual string so it can be sent through the socket
-    char *json_string = cJSON_Print(msg);
-    send(sock_fd, json_string, strlen(json_string), 0); // sends JSON string over socket to coordinator
-
-    cJSON_Delete(msg);   // frees JSON object memory
-    free(json_string);   // frees memory created by cJSON_Print()
+    cJSON *payload_value = cJSON_CreateString(payload != NULL ? payload : "");
+    send_json_with_payload(sock_fd, type, payload_value);
 }
 
 /// @brief Sends a handshake payload describing worker build/runtime compatibility.
@@ -92,50 +103,29 @@ static int receive_into_buffer(int sock_fd, char *buffer) {
     return bytes;
 }
 
-/// @brief Parses coordinator response type field into output buffer.
-/// @param json_input Raw JSON response from coordinator.
-/// @param out_type Destination buffer for "type" field.
-/// @param out_type_size Destination buffer size.
-/// @return 1 when parse succeeds and type is present, 0 otherwise.
-static int parse_response_type(const char *json_input, char *out_type, size_t out_type_size) {
-    cJSON *msg = cJSON_Parse(json_input);
-    if (msg == NULL) {
-        return 0;
-    }
-
-    cJSON *type = cJSON_GetObjectItem(msg, "type");
-    if (type == NULL || !cJSON_IsString(type)) {
-        cJSON_Delete(msg);
-        return 0;
-    }
-
-    // Copy type string into output buffer with safety checks.
-    strncpy(out_type, type->valuestring, out_type_size - 1);
-    out_type[out_type_size - 1] = '\0'; // Manually null-terminate to ensure safety.
-    cJSON_Delete(msg);
-    return 1;
-}
-
 /// @brief Performs compatibility handshake and returns 1 on success.
 /// @param sock_fd The file descriptor for the coordinator socket.
 /// @param buffer Reusable receive buffer.
 /// @return 1 if handshake accepted, 0 otherwise.
 static int perform_handshake(int sock_fd, char *buffer) {
-    char type_buffer[64];
-
     send_handshake_message(sock_fd);
+
     int bytes = receive_into_buffer(sock_fd, buffer);
     if (bytes <= 0) {
         return 0;
     }
 
-    if (!parse_response_type(buffer, type_buffer, sizeof(type_buffer))) {
+    cJSON *msg = cJSON_Parse(buffer);
+    if (msg == NULL) {
         return 0;
     }
 
-    // Handshake is successful if coordinator responds with handshake_ack.
-    // Any other response (including handshake_reject) is a failure.
-    if (strcmp(type_buffer, MSG_TYPE_HANDSHAKE_ACK) != 0) {
+    cJSON *type = cJSON_GetObjectItem(msg, "type");
+    int accepted = cJSON_IsString(type) && strcmp(type->valuestring, MSG_TYPE_HANDSHAKE_ACK) == 0;
+
+    cJSON_Delete(msg);
+
+    if (!accepted) {
         printf("Handshake failed: %s\n", buffer);
         return 0;
     }
@@ -157,18 +147,181 @@ static void register_with_coordinator(int sock_fd, char *buffer) {
     }
 }
 
-/// @brief Requests a task from the coordinator and waits for a response.
-/// @param sock_fd The file descriptor for the coordinator socket.
-/// @param buffer The buffer to receive data into.
-static void request_task(int sock_fd, char *buffer) {
-    // Task Request Logic: After registering with the coordinator, the worker sends a "task_request"
-    // message to request work. It then waits for a response from the coordinator,
-    // which will either be a task assignment or a no-task message.
-    send_json_message(sock_fd, "task_request", "requesting work");
+/// @brief Executes a compile task received from the coordinator by invoking GCC.
+/// @param payload Parsed task payload containing source/object/flags.
+/// @param source Output buffer for source path.
+/// @param source_size Size of source buffer.
+/// @param object Output buffer for object path.
+/// @param object_size Size of object buffer.
+/// @param status_message Output buffer for human-readable result.
+/// @param status_message_size Size of status buffer.
+/// @param exit_code_out Exit code from GCC or local failure.
+/// @return 1 on successful compile, 0 on failure.
+static int run_compile_task(
+    cJSON *payload,
+    char *source,
+    size_t source_size,
+    char *object,
+    size_t object_size,
+    char *status_message,
+    size_t status_message_size,
+    int *exit_code_out
+) {
+    cJSON *source_json = cJSON_GetObjectItem(payload, "source");
+    cJSON *object_json = cJSON_GetObjectItem(payload, "object");
+    cJSON *flags_json = cJSON_GetObjectItem(payload, "flags");
 
-    int bytes = receive_into_buffer(sock_fd, buffer); // waits for coordinator to send something back
-    if (bytes > 0) {
-        printf("Task response from coordinator: %s\n", buffer); // coordinator response
+    if (!cJSON_IsString(source_json) || !cJSON_IsString(object_json) || !cJSON_IsArray(flags_json)) {
+        snprintf(status_message, status_message_size, "Task payload missing source/object/flags");
+        *exit_code_out = 1;
+        return 0;
+    }
+
+    snprintf(source, source_size, "%s", source_json->valuestring);
+    snprintf(object, object_size, "%s", object_json->valuestring);
+
+    char *argv[MAX_TASK_FLAGS + 7];
+    int argc = 0;
+    argv[argc++] = "gcc";
+
+    int flag_count = cJSON_GetArraySize(flags_json);
+    if (flag_count > MAX_TASK_FLAGS) {
+        snprintf(status_message, status_message_size, "Too many flags in task payload");
+        *exit_code_out = 1;
+        return 0;
+    }
+
+    for (int i = 0; i < flag_count; i++) {
+        cJSON *flag = cJSON_GetArrayItem(flags_json, i);
+        if (!cJSON_IsString(flag)) {
+            snprintf(status_message, status_message_size, "Flag at index %d is not a string", i);
+            *exit_code_out = 1;
+            return 0;
+        }
+        argv[argc++] = flag->valuestring;
+    }
+
+    // Add source and object arguments.
+    argv[argc++] = "-c";
+    argv[argc++] = source;
+    argv[argc++] = "-o";
+    argv[argc++] = object;
+    argv[argc] = NULL;
+
+    // Fork and exec GCC with the provided arguments, then wait for it to finish and capture the exit code.
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(status_message, status_message_size, "fork() failed");
+        *exit_code_out = 1;
+        return 0;
+    }
+
+    // In the child process, replace the image with GCC.
+    if (pid == 0) {
+        execvp("gcc", argv);
+        _exit(127);
+    }
+
+    // In the parent process, wait for the child to finish and capture its exit status.
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        snprintf(status_message, status_message_size, "waitpid() failed");
+        *exit_code_out = 1;
+        return 0;
+    }
+
+    // Check if GCC exited normally and capture the exit code. Construct a human-readable status message based on the result.
+    if (WIFEXITED(status)) {
+        *exit_code_out = WEXITSTATUS(status);
+        if (*exit_code_out == 0) {
+            snprintf(status_message, status_message_size, "Compiled %s -> %s", source, object);
+            return 1;
+        }
+
+        snprintf(status_message, status_message_size, "gcc failed for %s with exit code %d", source, *exit_code_out);
+        return 0;
+    }
+
+    snprintf(status_message, status_message_size, "gcc terminated abnormally for %s", source);
+    *exit_code_out = 1;
+    return 0;
+}
+
+/// @brief Sends compilation result details back to the coordinator.
+/// @param sock_fd Coordinator socket.
+/// @param source Source file path for the task.
+/// @param object Object file path for the task.
+/// @param status success/failure text.
+/// @param exit_code GCC exit code.
+/// @param message Human-readable task status message.
+static void send_task_result(int sock_fd, const char *source, const char *object, const char *status,
+    int exit_code, const char *message) {
+    cJSON *payload = cJSON_CreateObject();
+    cJSON_AddStringToObject(payload, "source", source);
+    cJSON_AddStringToObject(payload, "object", object);
+    cJSON_AddStringToObject(payload, "status", status);
+    cJSON_AddNumberToObject(payload, "exit_code", exit_code);
+    cJSON_AddStringToObject(payload, "message", message);
+
+    send_json_with_payload(sock_fd, MSG_TYPE_TASK_RESULT, payload);
+}
+
+/// @brief Requests one task from coordinator and processes it.
+/// @param sock_fd Coordinator socket.
+/// @param buffer Shared receive buffer.
+/// @return 1 if worker should continue requesting tasks, 0 otherwise.
+static int request_and_process_task(int sock_fd, char *buffer) {
+    send_json_message(sock_fd, MSG_TYPE_TASK_REQUEST, "requesting work");
+
+    int bytes = receive_into_buffer(sock_fd, buffer);
+    if (bytes <= 0) {
+        return 0;
+    }
+
+    cJSON *msg = cJSON_Parse(buffer);
+    if (msg == NULL) {
+        printf("Invalid task response: %s\n", buffer);
+        return 0;
+    }
+
+    cJSON *type = cJSON_GetObjectItem(msg, "type");
+    cJSON *payload = cJSON_GetObjectItem(msg, "payload");
+    if (!cJSON_IsString(type) || payload == NULL) {
+        cJSON_Delete(msg);
+        return 0;
+    }
+
+    if (strcmp(type->valuestring, MSG_TYPE_NO_TASK) == 0) {
+        printf("Coordinator reported no more tasks\n");
+        cJSON_Delete(msg);
+        return 0;
+    }
+
+    // For task assignments, run the compile and report the result back to the coordinator.
+    if (strcmp(type->valuestring, MSG_TYPE_TASK_ASSIGNMENT) == 0) {
+        char source[512] = {0};
+        char object[512] = {0};
+        char status_message[512] = {0};
+        int exit_code = 1;
+
+        int success = run_compile_task(payload, source, sizeof(source), object, sizeof(object),
+            status_message, sizeof(status_message), &exit_code);
+
+        printf("Task completed: %s\n", status_message);
+        send_task_result(sock_fd, source, object, success ? "success" : "failure", exit_code, status_message);
+    } else {
+        printf("Unexpected response from coordinator: %s\n", buffer);
+    }
+
+    cJSON_Delete(msg);
+    return 1;
+}
+
+/// @brief Continuously requests and executes tasks until coordinator has no more work.
+/// @param sock_fd Coordinator socket.
+/// @param buffer Shared receive buffer.
+static void execute_task_loop(int sock_fd, char *buffer) {
+    while (request_and_process_task(sock_fd, buffer)) {
     }
 }
 
@@ -179,28 +332,14 @@ static void heartbeat_loop(int sock_fd) {
         sleep(5); // every 5 seconds send heartbeat
 
         // heartbeat message tells coordinator this worker is still alive
-        cJSON *heartbeat = cJSON_CreateObject();
-        cJSON_AddStringToObject(heartbeat, "type", "heartbeat");
-        cJSON_AddStringToObject(heartbeat, "payload", "alive");
-
-        char *hb_string = cJSON_Print(heartbeat);
-        int result = send(sock_fd, hb_string, strlen(hb_string), 0);
-
-        cJSON_Delete(heartbeat);
-        free(hb_string);
-
-        if (result < 0) {
-            printf("Coordinator disconnected\n");
-            break;
-        }
-
+        send_json_message(sock_fd, "heartbeat", "alive");
         printf("Heartbeat sent\n");
     }
 }
 
 /// @brief The main entry point for the worker process.
 /// @return The exit status of the program.
-int main() {
+int main(void) {
     char buffer[BUFFER_SIZE];
     int sock_fd = create_worker_socket();
 
@@ -215,9 +354,9 @@ int main() {
         return 1;
     }
 
-    // Register with the coordinator, request a task, and start sending heartbeats in a loop.
+    // Register with the coordinator, request tasks, then keep sending heartbeats in a loop.
     register_with_coordinator(sock_fd, buffer);
-    request_task(sock_fd, buffer);
+    execute_task_loop(sock_fd, buffer);
     heartbeat_loop(sock_fd);
 
     close(sock_fd);
