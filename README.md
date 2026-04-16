@@ -33,22 +33,44 @@ A remote compiler that seeks to reduce program compilation time by coordinating 
 - Linux Distribution
 
 ### Add-ons
-TODO: List which add-ons are included in the project, and the purpose each add-on
-serves in your app.
+- cJSON (`libcjson-dev`): JSON message serialization/parsing between coordinator and workers.
+- toml11 (`libtoml11-dev`): system TOML parser used by the coordinator to load build manifests.
 
 ### Installation Steps
-- sudo apt install git
-- sudo apt install gcc
-- sudo apt install libcjson-dev
-- git clone https://github.com/remocom/compiler.git
-- make
-- cd compiler
-  - ./coordinator_app
-  - ./worker_app
+- `sudo apt install git`
+- `sudo apt install gcc`
+- `sudo apt install g++`
+- `sudo apt install libcjson-dev`
+- `sudo apt install libtoml11-dev`
+- `git clone https://github.com/remocom/compiler.git`
+- `make`
+- `cd compiler`
+   - `./coordinator_app --manifest build.toml`
+  - `./worker_app`
 
 ## Functionality
-TODO: Write usage instructions. Structuring it as a walkthrough can help structure
-this section, and showcase your features.
+1) Create a TOML build manifest (example: `build.toml`):
+
+```toml
+[build]
+output = "myprogram"
+flags = ["-O2", "-std=c11", "-Icommon"]
+sources = ["main.c", "common/common.c"]
+```
+
+2) Start the coordinator with the manifest:
+
+```bash
+./coordinator_app --manifest build.toml
+```
+
+3) Start one or more workers:
+
+```bash
+./worker_app
+```
+
+4) Workers request compilation tasks from the coordinator, run GCC with the manifest-provided flags, and report task results back to the coordinator.
 
 ## Known Problems
 TODO: Describe any known issues, bugs, odd behaviors or code smells.
