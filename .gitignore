@@ -2,6 +2,9 @@
 samples/
 *.zip
 
+# Build inputs
+manifest.toml
+
 # Build outputs
 coordinator_app
 worker_app
