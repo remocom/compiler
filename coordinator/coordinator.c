@@ -284,16 +284,24 @@ static void handle_task_result(int node_id, cJSON *payload) {
     cJSON *status = cJSON_GetObjectItem(payload, "status");
     cJSON *exit_code = cJSON_GetObjectItem(payload, "exit_code");
     cJSON *message = cJSON_GetObjectItem(payload, "message");
+    cJSON *output = cJSON_GetObjectItem(payload, "compiler_output");
+
+    const char *source_str = cJSON_IsString(source) ? source->valuestring : "<unknown>";
+    const char *object_str = cJSON_IsString(object) ? object->valuestring : "<unknown>";
+    const char *status_str = cJSON_IsString(status) ? status->valuestring : "<unknown>";
+    int exit_code_val = cJSON_IsNumber(exit_code) ? exit_code->valueint : -1;
+    const char *message_str = cJSON_IsString(message) ? message->valuestring : "<none>";
 
     log_event(
         "TASK RESULT | Node %d | source=%s | object=%s | status=%s | exit_code=%d | message=%s\n",
-        node_id,
-        cJSON_IsString(source) ? source->valuestring : "<unknown>",
-        cJSON_IsString(object) ? object->valuestring : "<unknown>",
-        cJSON_IsString(status) ? status->valuestring : "<unknown>",
-        cJSON_IsNumber(exit_code) ? exit_code->valueint : -1,
-        cJSON_IsString(message) ? message->valuestring : "<none>"
-    );
+        node_id, source_str, object_str, status_str, exit_code_val, message_str);
+
+    if(cJSON_IsString(output) && output->valuestring[0] != '\0'){
+        log_event("\n\n--- compiler output (Node %d, %s) ---\n%s\n--- end compiler output ---\n\n",
+            node_id, source_str, output->valuestring);
+        printf("\n\n--- compiler output (Node %d, source=%s, status=%s, exit_code=%d) ---\n%s--- end compiler output ---\n\n",
+            node_id, source_str, status_str, exit_code_val, output->valuestring);
+    }
 }
 
 /// @brief Handles a parsed worker message after JSON validation.
