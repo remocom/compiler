@@ -147,6 +147,46 @@ static void register_with_coordinator(int sock_fd, char *buffer) {
     }
 }
 
+/// @brief Allows parent to read from port that Child wrote to.
+/// @param read_fd Read-end of the pipe
+/// @param compiler_output Buffer that stores info from the pipe.
+/// @param compiler_output_size size of compiler_output buffer
+static void read_from_pipe(int read_fd, char *compiler_output, size_t compiler_output_size){
+    size_t total= 0;
+    ssize_t n = 0;
+    int truncated = 0;
+    char discard_buf[512]; // used to help drain the buffer in the event compiler_output gets filled to the max and additional bytes still remain in pipe.
+
+    while(1){
+        if(!truncated && compiler_output_size > 1){
+            size_t space_left = (compiler_output_size - 1) - total;
+            if (space_left == 0){
+                truncated = 1;
+                continue;
+            }
+            n = read(read_fd, compiler_output + total, space_left);
+            if(n > 0){
+                total += (size_t)n;
+                if(total >= compiler_output_size -1){
+                    truncated = 1; // stop storing but keep draining pipe
+                }
+                continue;
+            }
+        } else{
+            n = read(read_fd, discard_buf, sizeof(discard_buf));
+            if(n > 0){
+                truncated = 1;
+                continue;
+            }
+        }
+        break;
+    }
+
+    if(compiler_output_size > 0){
+        compiler_output[total] = '\0';
+    }
+}
+
 /// @brief Executes a compile task received from the coordinator by invoking GCC.
 /// @param payload Parsed task payload containing source/object/flags.
 /// @param source Output buffer for source path.
@@ -155,7 +195,10 @@ static void register_with_coordinator(int sock_fd, char *buffer) {
 /// @param object_size Size of object buffer.
 /// @param status_message Output buffer for human-readable result.
 /// @param status_message_size Size of status buffer.
+/// @param compiler_output Buffer that receives captured stdout/stderr from the compiler process.
+/// @param compiler_output_size Size of output buffer.
 /// @param exit_code_out Exit code from GCC or local failure.
+
 /// @return 1 on successful compile, 0 on failure.
 static int run_compile_task(
     cJSON *payload,
@@ -165,6 +208,8 @@ static int run_compile_task(
     size_t object_size,
     char *status_message,
     size_t status_message_size,
+    char *compiler_output,
+    size_t compiler_output_size,
     int *exit_code_out
 ) {
     cJSON *source_json = cJSON_GetObjectItem(payload, "source");
@@ -208,9 +253,23 @@ static int run_compile_task(
     argv[argc++] = object;
     argv[argc] = NULL;
 
+    /*
+     * Create pipe to capture stdout and stderr of child process
+     * pipefd[0] = read end
+     * pipefd[1] = write end
+    */
+    int pipefd[2];
+    if(pipe(pipefd) < 0){
+        snprintf(status_message, status_message_size, "pipe() failed");
+        *exit_code_out = 1;
+        return 0;
+    }
+
     // Fork and exec GCC with the provided arguments, then wait for it to finish and capture the exit code.
     pid_t pid = fork();
     if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
         snprintf(status_message, status_message_size, "fork() failed");
         *exit_code_out = 1;
         return 0;
@@ -218,9 +277,23 @@ static int run_compile_task(
 
     // In the child process, replace the image with GCC.
     if (pid == 0) {
+        close(pipefd[0]); // Child does not read
+
+         // Child: send both stdout and stderr into the same pipe
+        if((dup2(pipefd[1], STDOUT_FILENO) < 0 || dup2(pipefd[1], STDERR_FILENO) < 0)){
+            close(pipefd[1]);
+            _exit(127);
+        }
+
+        close(pipefd[1]);
         execvp("gcc", argv);
         _exit(127);
     }
+
+    close(pipefd[1]); // Parent does not write
+
+    read_from_pipe(pipefd[0], compiler_output, compiler_output_size);
+    close(pipefd[0]);
 
     // In the parent process, wait for the child to finish and capture its exit status.
     int status = 0;
@@ -254,14 +327,16 @@ static int run_compile_task(
 /// @param status success/failure text.
 /// @param exit_code GCC exit code.
 /// @param message Human-readable task status message.
+/// @param output Captured stdout/stderr from the compiler process.
 static void send_task_result(int sock_fd, const char *source, const char *object, const char *status,
-    int exit_code, const char *message) {
+    int exit_code, const char *message, const char *output) {
     cJSON *payload = cJSON_CreateObject();
     cJSON_AddStringToObject(payload, "source", source);
     cJSON_AddStringToObject(payload, "object", object);
     cJSON_AddStringToObject(payload, "status", status);
     cJSON_AddNumberToObject(payload, "exit_code", exit_code);
     cJSON_AddStringToObject(payload, "message", message);
+    cJSON_AddStringToObject(payload, "compiler_output", output);
 
     send_json_with_payload(sock_fd, MSG_TYPE_TASK_RESULT, payload);
 }
@@ -302,13 +377,14 @@ static int request_and_process_task(int sock_fd, char *buffer) {
         char source[512] = {0};
         char object[512] = {0};
         char status_message[512] = {0};
+        char compiler_output[2048] = {0}; // Could be larger but then a single JSON message could fill up fast. Future problem to handle.
         int exit_code = 1;
 
         int success = run_compile_task(payload, source, sizeof(source), object, sizeof(object),
-            status_message, sizeof(status_message), &exit_code);
+            status_message, sizeof(status_message), compiler_output, sizeof(compiler_output), &exit_code);
 
         printf("Task completed: %s\n", status_message);
-        send_task_result(sock_fd, source, object, success ? "success" : "failure", exit_code, status_message);
+        send_task_result(sock_fd, source, object, success ? "success" : "failure", exit_code, status_message, compiler_output);
     } else {
         printf("Unexpected response from coordinator: %s\n", buffer);
     }
