@@ -20,16 +20,6 @@
 /// @brief Represents the status of a worker node, which can be either dead or alive.
 typedef enum { dead, alive } NodeStatus;
 
-/// @brief Represents a worker node in the system, containing its ID, socket, IP address, last heartbeat timestamp, and status (alive or dead).
-typedef struct {
-    int nodeID;
-    int socketID;
-    char ip_address[INET_ADDRSTRLEN];
-    time_t last_heartbeat; // timestamp
-    NodeStatus status; // alive or dead
-    int handshake_completed;
-} Node;
-
 /// @brief Represents a compile task derived from the manifest, containing source/object paths, build output, and flags.
 typedef struct {
     char source_path[MAX_MANIFEST_VALUE];
@@ -38,6 +28,19 @@ typedef struct {
     char flags[MAX_FLAGS][MAX_MANIFEST_VALUE];
     int flag_count;
 } CompileTask;
+
+/// @brief Represents a worker node in the system, containing its ID, socket, IP address, last heartbeat timestamp, and status (alive or dead).
+typedef struct {
+    int nodeID;
+    int socketID;
+    char ip_address[INET_ADDRSTRLEN];
+    time_t last_heartbeat; // timestamp
+    NodeStatus status; // alive or dead
+    int handshake_completed;
+    int has_active_task; // 1 if worker is currently assigned a task
+    CompileTask current_task; // Copy of the task (valid only when has_active_task == 1)
+} Node;
+
 
 static Node workers[MAX_WORKERS];
 static int worker_count = 0;
@@ -234,6 +237,18 @@ static Node *find_worker_by_socket_unlocked(int client_fd) {
     return NULL;
 }
 
+/// @brief Appends a task to the end of the main queue for reassignment. Called must hold task_mutex
+/// @param task Tasks to re-enqueue
+static void enqueue_for_reassign_unlocked(const CompileTask *task){
+    if (total_tasks < MAX_TASKS){
+        task_queue[total_tasks] = *task;
+        total_tasks++;
+    } else {
+        log_event("[ERROR] Cannot re-enqueue task (queue full, MAX_TASKS = %d): source=%s - build will be incomplete\n",
+            MAX_TASKS, task->source_path);
+    }
+}
+
 /// @brief Assigns the next queued task to a worker or reports no-task.
 /// @param client_fd Worker socket.
 /// @param node_id Worker node ID for logging.
@@ -246,6 +261,15 @@ static void assign_task_to_worker(int client_fd, int node_id) {
         CompileTask task = task_queue[next_task_index];
         next_task_index++;
         pthread_mutex_unlock(&task_mutex);
+
+        // Record ownership so we can re-enqueue if this worker dies
+        pthread_mutex_lock(&workers_mutex);
+        Node *worker = find_worker_by_socket_unlocked(client_fd);
+        if(worker != NULL){
+            worker->current_task = task;
+            worker->has_active_task = 1;
+        }
+        pthread_mutex_unlock(&workers_mutex);
 
         // Build JSON payload for task assignment message.
         cJSON *payload = cJSON_CreateObject();
@@ -384,6 +408,16 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
         assign_task_to_worker(client_fd, node_id); // Assign next task or report no-task.
     } else if (strcmp(type->valuestring, MSG_TYPE_TASK_RESULT) == 0) {
         handle_task_result(node_id, payload); // Log the task result reported by the worker.
+
+        // Worker finished this task - clear the active-task marker so it death
+        // from now on doesn't trigger a task reassignment
+        pthread_mutex_lock(&workers_mutex);
+        Node *completed_worker = find_worker_by_socket_unlocked(client_fd);
+        if(completed_worker != NULL){
+            completed_worker->has_active_task = 0;
+        }
+        pthread_mutex_unlock(&workers_mutex);
+
     } else {
         send_json_message(client_fd, "unknown", "Unknown message type");
     }
@@ -402,9 +436,22 @@ static void remove_worker_by_socket(int client_fd) {
         if (worker->socketID == client_fd) {
             if (worker->status == dead) {
                 log_event("REMOVED (timeout) Node %d | IP: %s\n", worker->nodeID, worker->ip_address);
+                // Monitor already re-queued the task (if any) when it set status = dead.
             } else {
                 log_event("DISCONNECT Node %d | IP: %s | Socket: %d\n",
                     worker->nodeID, worker->ip_address, worker->socketID);
+                
+                // Worker disconnected before monitor saw it - re-queue its task here
+                if(worker->has_active_task){
+                    log_event("RE-ENQUEUE task for reassignment | Node %d | Source: %s\n",
+                    worker->nodeID, worker->current_task.source_path);
+
+                    pthread_mutex_lock(&task_mutex);
+                    enqueue_for_reassign_unlocked(&worker->current_task);
+                    pthread_mutex_unlock(&task_mutex);
+
+                    worker->has_active_task = 0;
+                }
             }
 
             *worker = workers[worker_count - 1];
@@ -440,6 +487,8 @@ static int register_worker(int client_fd, const struct sockaddr_in *client_addr)
     worker->last_heartbeat = time(NULL);
     worker->status = alive;
     worker->handshake_completed = 0;
+    worker->has_active_task = 0;
+    // current_task left uninitialized - unsed until has_active_task becomes 1
 
     // Convert the client's IP address to a string and store it in the worker struct.
     inet_ntop(AF_INET, &client_addr->sin_addr, worker->ip_address, INET_ADDRSTRLEN);
@@ -537,6 +586,18 @@ static void *monitor_workers(void *arg) {
                 // Mark the worker as dead and close its socket.
                 worker->status = dead;
                 close(worker->socketID);
+
+                // If this worker was mid-task, push the task back for reassignment
+                if(worker->has_active_task){
+                    log_event("RE-ENQUEUE task for reassignment | Node %d | Source: %s\n",
+                    worker->nodeID, worker->current_task.source_path);
+
+                    pthread_mutex_lock(&task_mutex);
+                    enqueue_for_reassign_unlocked(&worker->current_task);
+                    pthread_mutex_unlock(&task_mutex);
+
+                    worker->has_active_task = 0;
+                }
             }
         }
         pthread_mutex_unlock(&workers_mutex); // Unlock worker list.
