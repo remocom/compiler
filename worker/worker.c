@@ -6,8 +6,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <stdarg.h>
 #include <sys/wait.h>
 #include <cjson/cJSON.h>
 #include "../common/common.h"
@@ -17,6 +16,28 @@
 #define MAX_TASK_FLAGS 64
 #define DISCARD_BUFFER_SIZE 4096
 #define MAX_COMPILER_ARGS (MAX_TASK_FLAGS * 3 + 10)
+#define WORKER_PATH_SIZE 512
+#define WORKER_LOCAL_OBJECT_SIZE (WORKER_PATH_SIZE + 32)
+#define WORKER_STATUS_SIZE 512
+#define WORKER_COMPILER_OUTPUT_SIZE 2048
+
+/// @brief Structure to hold the state of a task execution within the worker.
+typedef struct {
+    cJSON *payload;
+    cJSON *source_json;
+    cJSON *object_json;
+    cJSON *files_json;
+    char source[WORKER_PATH_SIZE];
+    char object[WORKER_PATH_SIZE];
+    char task_dir[WORKER_PATH_SIZE];
+    char local_source[WORKER_PATH_SIZE];
+    char local_object[WORKER_LOCAL_OBJECT_SIZE];
+    char status_message[WORKER_STATUS_SIZE];
+    char compiler_output[WORKER_COMPILER_OUTPUT_SIZE];
+    int exit_code;
+    int success;
+    int task_dir_created;
+} WorkerTaskExecution;
 
 /// @brief Creates a new socket for the worker to communicate with the coordinator.
 /// @return The file descriptor for the created socket.
@@ -262,123 +283,223 @@ static void register_with_coordinator(int sock_fd, char *buffer) {
     }
 }
 
-/// @brief Executes a compile task received from the coordinator by invoking the appropriate compiler driver.
-/// @param payload Parsed task payload containing source/object/flags.
-/// @param source Output buffer for source path.
-/// @param source_size Size of source buffer.
-/// @param object Output buffer for object path.
-/// @param object_size Size of object buffer.
-/// @param status_message Output buffer for human-readable result.
-/// @param status_message_size Size of status buffer.
-/// @param compiler_output Buffer that receives captured stdout/stderr from the compiler process.
-/// @param compiler_output_size Size of output buffer.
-/// @param exit_code_out Exit code from the compiler driver or local failure.
+/// @brief Initializes a worker task execution structure.
+/// @param task The task execution structure to initialize.
+/// @param payload The JSON payload containing the task information.
+static void init_task_execution(WorkerTaskExecution *task, cJSON *payload) {
+    memset(task, 0, sizeof(*task));
+    task->payload = payload;
+    task->exit_code = 1;
+    snprintf(task->task_dir, sizeof(task->task_dir), "/tmp/remocom-worker-XXXXXX");
+}
 
-/// @return 1 on successful compile, 0 on failure.
-static int run_compile_task(
-    cJSON *payload,
-    const char *local_source,
-    const char *local_object,
-    const char *task_dir,
-    char *source,
-    size_t source_size,
-    char *object,
-    size_t object_size,
-    char *status_message,
-    size_t status_message_size,
-    char *compiler_output,
-    size_t compiler_output_size,
-    int *exit_code_out
-) {
-    cJSON *source_json = cJSON_GetObjectItem(payload, "source");
-    cJSON *object_json = cJSON_GetObjectItem(payload, "object");
-    cJSON *flags_json = cJSON_GetObjectItem(payload, "flags");
+/// @brief Sets the status message for a worker task execution.
+/// @param task The task execution structure for which to set the status.
+/// @param format The format string for the status message.
+/// @param ... The arguments for the format string.
+static void set_task_status(WorkerTaskExecution *task, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    vsnprintf(task->status_message, sizeof(task->status_message), format, args);
+    va_end(args);
+}
 
-    if (!cJSON_IsString(source_json) || !cJSON_IsString(object_json) || !cJSON_IsArray(flags_json)) {
-        snprintf(status_message, status_message_size, "Task payload missing source/object/flags");
-        *exit_code_out = 1;
+/// @brief Parses the task assignment payload and initializes the task execution structure.
+/// @param task The task execution structure to initialize.
+/// @return 1 if parsing is successful, 0 otherwise.
+static int parse_task_assignment_payload(WorkerTaskExecution *task) {
+    task->source_json = cJSON_GetObjectItem(task->payload, "source");
+    task->object_json = cJSON_GetObjectItem(task->payload, "object");
+    task->files_json = cJSON_GetObjectItem(task->payload, "files");
+
+    if (cJSON_IsString(task->source_json)) {
+        snprintf(task->source, sizeof(task->source), "%s", task->source_json->valuestring);
+    }
+    if (cJSON_IsString(task->object_json)) {
+        snprintf(task->object, sizeof(task->object), "%s", task->object_json->valuestring);
+    }
+
+    if (!cJSON_IsString(task->source_json)) {
+        set_task_status(task, "Task payload missing source");
         return 0;
     }
 
-    snprintf(source, source_size, "%s", source_json->valuestring);
-    snprintf(object, object_size, "%s", object_json->valuestring);
-    const char *compiler_driver = remocom_select_source_driver(source_json->valuestring);
+    return 1;
+}
 
-    char *argv[MAX_COMPILER_ARGS];
-    char task_include_paths[MAX_TASK_FLAGS][512];
+/// @brief Creates a temporary directory for the task execution.
+/// @param task The task execution structure for which to create the directory.
+/// @return 1 if the directory is created successfully, 0 otherwise.
+static int create_task_directory(WorkerTaskExecution *task) {
+    if (mkdtemp(task->task_dir) == NULL) {
+        set_task_status(task, "mkdtemp() failed");
+        return 0;
+    }
+
+    task->task_dir_created = 1;
+    snprintf(task->local_object, sizeof(task->local_object), "%s/output.o", task->task_dir);
+    return 1;
+}
+
+/// @brief Receives the input files for the task execution.
+/// @param sock_fd The file descriptor for the coordinator socket.
+/// @param task The task execution structure for which to receive inputs.
+/// @return 1 if the inputs are received successfully, 0 otherwise.
+static int receive_task_inputs(int sock_fd, WorkerTaskExecution *task) {
+    return receive_task_files(
+        sock_fd,
+        task->files_json,
+        task->task_dir,
+        task->source_json->valuestring,
+        task->local_source,
+        sizeof(task->local_source),
+        task->status_message,
+        sizeof(task->status_message)
+    );
+}
+
+/// @brief Appends include arguments for the task compilation.
+/// @param flags_json The JSON array containing the compilation flags.
+/// @param flag_index The index of the current flag.
+/// @param flag_value The value of the current flag.
+/// @param task The task execution structure.
+/// @param argv The argument vector for the compiler command.
+/// @param argc A pointer to the argument count.
+/// @param task_include_paths An array to store the include paths.
+/// @param task_include_count A pointer to the count of include paths.
+static void append_task_include_args(
+    cJSON *flags_json,
+    int flag_index,
+    const char *flag_value,
+    const WorkerTaskExecution *task,
+    char **argv,
+    int *argc,
+    char task_include_paths[MAX_TASK_FLAGS][WORKER_PATH_SIZE],
+    int *task_include_count
+) {
+    if (strcmp(flag_value, "-I") == 0 && flag_index + 1 < cJSON_GetArraySize(flags_json)) {
+        cJSON *include_dir = cJSON_GetArrayItem(flags_json, flag_index + 1);
+        if (cJSON_IsString(include_dir) && *task_include_count < MAX_TASK_FLAGS) {
+            argv[(*argc)++] = "-I";
+            make_task_include_path(task->task_dir, include_dir->valuestring,
+                task_include_paths[*task_include_count], WORKER_PATH_SIZE);
+            argv[(*argc)++] = task_include_paths[*task_include_count];
+            (*task_include_count)++;
+        }
+    } else if (strncmp(flag_value, "-I", 2) == 0 && flag_value[2] != '\0' &&
+        *task_include_count < MAX_TASK_FLAGS) {
+        make_task_include_path(task->task_dir, flag_value + 2,
+            task_include_paths[*task_include_count], WORKER_PATH_SIZE);
+        argv[(*argc)++] = "-I";
+        argv[(*argc)++] = task_include_paths[*task_include_count];
+        (*task_include_count)++;
+    }
+
+}
+
+/// @brief Builds the argument vector for the compiler command.
+/// @param task The task execution structure.
+/// @param argv The argument vector for the compiler command.
+/// @param task_include_paths An array to store the include paths.
+/// @param compiler_driver_out A pointer to the compiler driver string.
+/// @return 1 if the argument vector is built successfully, 0 otherwise.
+static int build_compile_argv(
+    WorkerTaskExecution *task,
+    char **argv,
+    char task_include_paths[MAX_TASK_FLAGS][WORKER_PATH_SIZE],
+    const char **compiler_driver_out
+) {
+    cJSON *flags_json = cJSON_GetObjectItem(task->payload, "flags");
+
+    if (!cJSON_IsString(task->source_json) || !cJSON_IsString(task->object_json) || !cJSON_IsArray(flags_json)) {
+        set_task_status(task, "Task payload missing source/object/flags");
+        task->exit_code = 1;
+        return 0;
+    }
+
+    snprintf(task->source, sizeof(task->source), "%s", task->source_json->valuestring);
+    snprintf(task->object, sizeof(task->object), "%s", task->object_json->valuestring);
+    const char *compiler_driver = remocom_select_source_driver(task->source_json->valuestring);
+    *compiler_driver_out = compiler_driver;
+
     int task_include_count = 0;
     int argc = 0;
     argv[argc++] = (char *)compiler_driver;
 
     int flag_count = cJSON_GetArraySize(flags_json);
     if (flag_count > MAX_TASK_FLAGS) {
-        snprintf(status_message, status_message_size, "Too many flags in task payload");
-        *exit_code_out = 1;
+        set_task_status(task, "Too many flags in task payload");
+        task->exit_code = 1;
         return 0;
     }
 
     for (int i = 0; i < flag_count; i++) {
         cJSON *flag = cJSON_GetArrayItem(flags_json, i);
         if (!cJSON_IsString(flag)) {
-            snprintf(status_message, status_message_size, "Flag at index %d is not a string", i);
-            *exit_code_out = 1;
+            set_task_status(task, "Flag at index %d is not a string", i);
+            task->exit_code = 1;
             return 0;
         }
         argv[argc++] = flag->valuestring;
 
-        if (strcmp(flag->valuestring, "-I") == 0 && i + 1 < flag_count) {
-            cJSON *include_dir = cJSON_GetArrayItem(flags_json, i + 1);
-            if (cJSON_IsString(include_dir) && task_include_count < MAX_TASK_FLAGS) {
-                argv[argc++] = "-I";
-                make_task_include_path(task_dir, include_dir->valuestring,
-                    task_include_paths[task_include_count], sizeof(task_include_paths[task_include_count]));
-                argv[argc++] = task_include_paths[task_include_count];
-                task_include_count++;
-            }
-        } else if (strncmp(flag->valuestring, "-I", 2) == 0 && flag->valuestring[2] != '\0' &&
-            task_include_count < MAX_TASK_FLAGS) {
-            make_task_include_path(task_dir, flag->valuestring + 2,
-                task_include_paths[task_include_count], sizeof(task_include_paths[task_include_count]));
-            argv[argc++] = "-I";
-            argv[argc++] = task_include_paths[task_include_count];
-            task_include_count++;
-        }
+        append_task_include_args(flags_json, i, flag->valuestring, task, argv, &argc,
+            task_include_paths, &task_include_count);
     }
 
     argv[argc++] = "-I";
-    argv[argc++] = (char *)task_dir;
+    argv[argc++] = task->task_dir;
 
     // Add source and object arguments.
     argv[argc++] = "-c";
-    argv[argc++] = (char *)local_source;
+    argv[argc++] = task->local_source;
     argv[argc++] = "-o";
-    argv[argc++] = (char *)local_object;
+    argv[argc++] = task->local_object;
     argv[argc] = NULL;
+    return 1;
+}
+
+/// @brief Executes a compile task received from the coordinator.
+/// @param task The task execution structure containing the task details.
+/// @return 1 if the compilation succeeded, 0 otherwise.
+static int run_compile_task(WorkerTaskExecution *task) {
+    char *argv[MAX_COMPILER_ARGS];
+    char task_include_paths[MAX_TASK_FLAGS][WORKER_PATH_SIZE];
+    const char *compiler_driver = NULL;
+
+    if (!build_compile_argv(task, argv, task_include_paths, &compiler_driver)) {
+        return 0;
+    }
 
     int status = 0;
-    if (!remocom_run_process_capture(argv, compiler_output, compiler_output_size, &status)) {
-        snprintf(status_message, status_message_size, "Compiler process failed: %s", strerror(errno));
-        *exit_code_out = 1;
+    if (!remocom_run_process_capture(
+        argv,
+        task->compiler_output,
+        sizeof(task->compiler_output),
+        &status
+    )) {
+        set_task_status(task, "Compiler process failed: %s", strerror(errno));
+        task->exit_code = 1;
         return 0;
     }
 
     // Check if the compiler exited normally and capture the exit code.
     // Construct a human-readable status message based on the result.
     if (WIFEXITED(status)) {
-        *exit_code_out = WEXITSTATUS(status);
-        if (*exit_code_out == 0) {
-            snprintf(status_message, status_message_size, "Compiled %s -> %s with %s",
-                source, object, compiler_driver);
+        task->exit_code = WEXITSTATUS(status);
+        if (task->exit_code == 0) {
+            set_task_status(task, "Compiled %s -> %s with %s",
+                task->source, task->object, compiler_driver);
             return 1;
         }
 
-        snprintf(status_message, status_message_size, "%s failed for %s with exit code %d",
-            compiler_driver, source, *exit_code_out);
+        set_task_status(task, "%s failed for %s with exit code %d",
+            compiler_driver, task->source, task->exit_code);
         return 0;
     }
 
-    snprintf(status_message, status_message_size, "%s terminated abnormally for %s", compiler_driver, source);
-    *exit_code_out = 1;
+    set_task_status(task, "%s terminated abnormally for %s",
+        compiler_driver, task->source);
+    task->exit_code = 1;
     return 0;
 }
 
@@ -414,6 +535,47 @@ static void send_task_result(int sock_fd, const char *source, const char *object
     send_json_with_payload(sock_fd, MSG_TYPE_TASK_RESULT, payload);
     if (has_object) {
         remocom_send_file_stream(sock_fd, local_object);
+    }
+}
+
+/// @brief Sends the result of a task execution back to the coordinator.
+/// @param sock_fd The file descriptor for the coordinator socket.
+/// @param task The task execution structure containing the result details.
+static void send_task_execution_result(int sock_fd, const WorkerTaskExecution *task) {
+    send_task_result(
+        sock_fd,
+        task->source,
+        task->object,
+        task->success ? "success" : "failure",
+        task->exit_code,
+        task->status_message,
+        task->compiler_output,
+        task->local_object,
+        task->success
+    );
+}
+
+/// @brief Processes a task assignment message from the coordinator, executing the compile
+/// and reporting the result.
+/// @param sock_fd The file descriptor for the coordinator socket.
+/// @param payload The JSON payload containing the task assignment details.
+static void process_task_assignment(int sock_fd, cJSON *payload) {
+    WorkerTaskExecution task;
+    init_task_execution(&task, payload);
+
+    if (!parse_task_assignment_payload(&task)) {
+        discard_task_files(sock_fd, task.files_json);
+    } else if (!create_task_directory(&task)) {
+        discard_task_files(sock_fd, task.files_json);
+    } else if (receive_task_inputs(sock_fd, &task)) {
+        task.success = run_compile_task(&task);
+    }
+
+    printf("Task completed: %s\n", task.status_message);
+    send_task_execution_result(sock_fd, &task);
+
+    if (task.task_dir_created) {
+        cleanup_tree(task.task_dir);
     }
 }
 
@@ -454,49 +616,7 @@ static int request_and_process_task(int sock_fd, char *buffer) {
 
     // For task assignments, run the compile and report the result back to the coordinator.
     if (strcmp(type->valuestring, MSG_TYPE_TASK_ASSIGNMENT) == 0) {
-        char source[512] = {0};
-        char object[512] = {0};
-        char task_dir[] = "/tmp/remocom-worker-XXXXXX";
-        char local_source[512] = {0};
-        char local_object[512] = {0};
-        char status_message[512] = {0};
-        char compiler_output[2048] = {0}; // Could be larger but then a single JSON message could fill up fast. Future problem to handle.
-        int exit_code = 1;
-        int success = 0;
-
-        cJSON *source_json = cJSON_GetObjectItem(payload, "source");
-        cJSON *object_json = cJSON_GetObjectItem(payload, "object");
-        cJSON *files_json = cJSON_GetObjectItem(payload, "files");
-
-        if (cJSON_IsString(source_json)) {
-            snprintf(source, sizeof(source), "%s", source_json->valuestring);
-        }
-        if (cJSON_IsString(object_json)) {
-            snprintf(object, sizeof(object), "%s", object_json->valuestring);
-        }
-
-        if (!cJSON_IsString(source_json)) {
-            snprintf(status_message, sizeof(status_message), "Task payload missing source");
-            discard_task_files(sock_fd, files_json);
-        } else if (mkdtemp(task_dir) == NULL) {
-            snprintf(status_message, sizeof(status_message), "mkdtemp() failed");
-            discard_task_files(sock_fd, files_json);
-        } else {
-            snprintf(local_object, sizeof(local_object), "%s/output.o", task_dir);
-
-            if (!receive_task_files(sock_fd, files_json, task_dir, source_json->valuestring,
-                local_source, sizeof(local_source), status_message, sizeof(status_message))) {
-                success = 0;
-            } else {
-                success = run_compile_task(payload, local_source, local_object, task_dir, source, sizeof(source), object, sizeof(object),
-                    status_message, sizeof(status_message), compiler_output, sizeof(compiler_output), &exit_code);
-            }
-        }
-
-        printf("Task completed: %s\n", status_message);
-        send_task_result(sock_fd, source, object, success ? "success" : "failure", exit_code,
-            status_message, compiler_output, local_object, success);
-        cleanup_tree(task_dir);
+        process_task_assignment(sock_fd, payload);
     } else {
         char *response = cJSON_PrintUnformatted(msg);
         printf("Unexpected response from coordinator: %s\n", response != NULL ? response : "<unprintable>");
