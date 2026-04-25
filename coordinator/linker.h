@@ -12,6 +12,7 @@ typedef struct {
     const BuildManifest *manifest;
     const CompileTask *tasks;
     int task_count;
+    int keep_objects;
     LinkerLogFn log_message;
     void *callback_ctx;
 } LinkerContext;

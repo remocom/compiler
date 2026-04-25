@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "../common/common.h"
 
@@ -63,6 +64,27 @@ static const char *select_linker_driver(const LinkerContext *ctx) {
     }
 
     return "gcc";
+}
+
+/// @brief Removes intermediate object files after a successful link unless retention was requested.
+/// @param ctx The linker context containing object file paths and retention setting.
+static void cleanup_object_files(const LinkerContext *ctx) {
+    if (ctx->keep_objects) {
+        linker_logf(ctx, "OBJECT CLEANUP SKIPPED | keep_objects=true\n");
+        return;
+    }
+
+    for (int i = 0; i < ctx->task_count; i++) {
+        const char *object_path = ctx->tasks[i].object_path;
+        if (unlink(object_path) == 0) {
+            linker_logf(ctx, "OBJECT REMOVED | object=%s\n", object_path);
+            printf("Removed object file: %s\n", object_path);
+        } else if (errno != ENOENT) {
+            linker_logf(ctx, "[WARNING] Failed to remove object file | object=%s | error=%s\n",
+                object_path, strerror(errno));
+            printf("Failed to remove object file %s: %s\n", object_path, strerror(errno));
+        }
+    }
 }
 
 int remocom_run_link_step(const LinkerContext *ctx) {
@@ -138,6 +160,7 @@ int remocom_run_link_step(const LinkerContext *ctx) {
         linker_logf(ctx, "LINK SUCCEEDED | output=%s\n", manifest->output);
         write_linker_log(linker_log, "status=succeeded\nexit_code=0\n");
         printf("Link succeeded: %s\n", manifest->output);
+        cleanup_object_files(ctx);
         if (linker_log != NULL) {
             fclose(linker_log);
         }
