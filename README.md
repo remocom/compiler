@@ -73,10 +73,24 @@ sources = ["main.c", "common/common.c"]
 4) Workers request compilation tasks from the coordinator, run GCC with the manifest-provided flags, and report task results back to the coordinator.
 
 ### 4 Themes Used
-- Network Programming 
+- Network Programming
+  - Project allows multiple devices to communicate over a network to accomplish the shared goal of compiling a program.
+  - Coordinator and worker nodes communicate over TCP sockets.
+
 - Remote Procedure Calls
+  -  When the Coordinator receives a compile job, it forwards a JSON-protocol message to an available worker node that performs the compilation and returns the result.
+
 - Distributed Systems
+  -  Fault Tolerance - The coordinator detects worker failure two ways: (1) when a worker stops sending heartbeats and (2) when a node socket is closed off. In both cases, the coordinator recognizes the worker as dead and cleans up appropriately, being sure to reassign the task to another worker node.
+  -  Concurrent Programming - When a worker connects, the coordinator’s main accept() loop hands the connection off to a dedicated handler thread, so the main loop can immediately go back to accepting new workers. This lets workers join at any time without being blocked by other workers being served at the moment.
+  -  The coordinator utilizes multithreading to handle incoming responses from Worker nodes.
+  -  Race conditions are handled using mutex locks.
+- Control Processes
+  -  For each worker node, fork() is called to create a child process that runs gcc using execvp(). Once the child process exit status is returned using waitpid(), the status code is analyzed to determine if compilation was successful.
+-  System I/O
+   - A pipe is created before forking, and the child uses dup2() to redirect STDOUT_FILENO and STDERR_FILENO into the pipe so the parent can capture all of gcc's output. It's worth noting that the parent drains the pipe before calling waitpid() to avoid a deadlock if gcc produces more output than the pipe buffer can hold.
 - Running Programs / Linking
+  -  The worker nodes compile the source code and return the object files to the client for the client to run.
 
 ### Design Decisions/Trade-Offs 
 
