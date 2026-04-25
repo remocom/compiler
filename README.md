@@ -10,12 +10,13 @@ A remote compiler that seeks to reduce program compilation time by coordinating 
 
 ### Additional Information
 1) A central machine (“the coordinator”)
-   - Initiates a build via the use of a build manifest, using it as a guide when determining what machines will be responsible for what
-   - Responsible for performing linking and having a set of procedures in place for handling issues like the disconnection of a node during a job, creating system resilience
-2) Responsibilities are assigned using calculations from a cost function that takes into account a number of factors, including but not limited to:
-   - The amount of time it would take for the node to transfer a file
-   - How many jobs are already queued and their expected completion times
-   - A reliability metric
+   - Initiates a build using a TOML build manifest, turns each source file into a compile task, and dispatches tasks to connected workers
+   - Receives object files from workers and performs the final link step
+   - Reassigns an active task if the worker handling it disconnects or stops sending heartbeats
+2) Compile tasks are assigned from a shared queue:
+   - Workers request work from the coordinator after registering
+   - The coordinator sends the next available task, along with the source and header files needed to compile it
+   - If no tasks are available, the worker stops requesting work and continues sending heartbeat messages
 3) When joining the compilation network, nodes engage in a handshake with the coordinator to ensure that they’re capable of compiling the file in such a way that it could be integrated within the larger solution. During this handshake process, the compiler confirms:
    - Architecture
    - Compiler version
@@ -30,23 +31,34 @@ A remote compiler that seeks to reduce program compilation time by coordinating 
 
 ## Installation
 ### Prerequisites
-- Linux Distribution
+- A Linux distro
+- GCC, G++, and Make
+- cJSON
+- toml11
 
-### Add-ons
-- cJSON (`libcjson-dev`): JSON message serialization/parsing between coordinator and workers.
-- toml11 (`libtoml11-dev`): system TOML parser used by the coordinator to load build manifests.
+On Debian/Ubuntu-based systems:
+
+```bash
+sudo apt install git make gcc g++ libcjson-dev libtoml11-dev
+```
 
 ### Installation Steps
-- `sudo apt install git`
-- `sudo apt install gcc`
-- `sudo apt install g++`
-- `sudo apt install libcjson-dev`
-- `sudo apt install libtoml11-dev`
-- `git clone https://github.com/remocom/compiler.git`
-- `make`
-- `cd compiler`
-   - `./coordinator_app --manifest build.toml`
-  - `./worker_app`
+```bash
+git clone https://github.com/remocom/compiler.git
+cd compiler
+make
+```
+
+This builds two executables in the repository root:
+
+- `coordinator_app`
+- `worker_app`
+
+To remove generated binaries and object files:
+
+```bash
+make clean
+```
 
 ## Functionality
 1) Create a TOML build manifest (example: `build.toml`):
@@ -56,7 +68,18 @@ A remote compiler that seeks to reduce program compilation time by coordinating 
 output = "myprogram"
 flags = ["-O2", "-std=c11", "-Icommon"]
 sources = ["main.c", "common/common.c"]
+headers = ["common/common.h"]
 ```
+
+Required fields:
+
+- `output`: final executable name produced by the coordinator's link step.
+- `sources`: source files to compile remotely.
+
+Optional fields:
+
+- `flags`: compiler and linker flags passed to each compile task and the final link command.
+- `headers`: additional project headers to transfer to workers. The coordinator also scans dependencies with `gcc -MM` or `g++ -MM` and transfers discovered headers.
 
 2) Start the coordinator with the manifest:
 
@@ -64,13 +87,47 @@ sources = ["main.c", "common/common.c"]
 ./coordinator_app --manifest build.toml
 ```
 
-3) Start one or more workers:
+By default, the coordinator listens only on `127.0.0.1` for local workers. To accept workers from other machines on your network, start it with:
+
+```bash
+./coordinator_app --manifest build.toml --allow-external-workers
+```
+
+The coordinator accepts the same manifest with `-m`:
+
+```bash
+./coordinator_app -m build.toml
+```
+
+By default, intermediate object files are removed after a successful link. To keep them:
+
+```bash
+./coordinator_app --manifest build.toml --keep-objects
+```
+
+3) Start one or more workers on the same machine:
 
 ```bash
 ./worker_app
 ```
 
-4) Workers request compilation tasks from the coordinator, run GCC with the manifest-provided flags, and report task results back to the coordinator.
+To join from another machine, point the worker at the coordinator's LAN IP or hostname:
+
+```bash
+./worker_app --coordinator 192.168.1.25
+```
+
+4) Workers request compilation tasks from the coordinator, receive the needed source/header files, run `gcc` or `g++` based on the source extension, and send object files plus compiler output back to the coordinator.
+
+5) When all objects are ready, the coordinator links the final executable. The linker uses `g++` if any manifest source is a C++ file; otherwise it uses `gcc`.
+
+### Runtime Notes
+- Coordinator and worker communication uses TCP port `5000`.
+- The coordinator writes `coordinator.log` in the manifest directory.
+- The link step writes `linker.log` in the manifest directory.
+- The coordinator changes into the manifest's directory before dispatching tasks, so relative manifest paths are resolved from the manifest location.
+- Workers create temporary task directories under `/tmp` and remove them after each compile task.
+- Workers send heartbeats every 5 seconds after completing assigned tasks.
 
 ### Themes Used
 - Network Programming
@@ -140,4 +197,4 @@ Additional project documentation can be found in the `docs/` folder:
 
 - `docs/LICENSE.txt` → license statement
 - `docs/ProjectProposalTemplate (1).pdf` → contains the original project proposal, including goals, design ideas, and planned system architecture
-- `docs/Testing` → contains screenshots of testing throughout the developement process
+- `docs/Testing` → contains screenshots of testing throughout the development process
