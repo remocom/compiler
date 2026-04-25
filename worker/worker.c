@@ -109,6 +109,27 @@ static const char *relative_transfer_path(const char *path) {
     return path;
 }
 
+/// @brief Checks whether a source path should use the C++ compiler driver.
+/// @param source_path Source path from the task payload.
+/// @return 1 for common C++ source extensions, 0 otherwise.
+static int is_cpp_source_path(const char *source_path) {
+    const char *extension = strrchr(source_path, '.');
+    if (extension == NULL) {
+        return 0;
+    }
+
+    return strcmp(extension, ".cpp") == 0 ||
+        strcmp(extension, ".cc") == 0 ||
+        strcmp(extension, ".cxx") == 0 ||
+        strcmp(extension, ".C") == 0;
+}
+
+/// @brief Selects the compiler driver for a source file.
+/// @return "g++" for C++ sources, otherwise "gcc".
+static const char *select_source_driver(const char *source_path) {
+    return is_cpp_source_path(source_path) ? "g++" : "gcc";
+}
+
 /// @brief Constructs the full path for an include file within the task directory.
 /// @param task_dir The directory for the current task.
 /// @param include_path The path of the include file.
@@ -322,7 +343,7 @@ static void read_from_pipe(int read_fd, char *compiler_output, size_t compiler_o
     }
 }
 
-/// @brief Executes a compile task received from the coordinator by invoking GCC.
+/// @brief Executes a compile task received from the coordinator by invoking the appropriate compiler driver.
 /// @param payload Parsed task payload containing source/object/flags.
 /// @param source Output buffer for source path.
 /// @param source_size Size of source buffer.
@@ -332,7 +353,7 @@ static void read_from_pipe(int read_fd, char *compiler_output, size_t compiler_o
 /// @param status_message_size Size of status buffer.
 /// @param compiler_output Buffer that receives captured stdout/stderr from the compiler process.
 /// @param compiler_output_size Size of output buffer.
-/// @param exit_code_out Exit code from GCC or local failure.
+/// @param exit_code_out Exit code from the compiler driver or local failure.
 
 /// @return 1 on successful compile, 0 on failure.
 static int run_compile_task(
@@ -362,12 +383,13 @@ static int run_compile_task(
 
     snprintf(source, source_size, "%s", source_json->valuestring);
     snprintf(object, object_size, "%s", object_json->valuestring);
+    const char *compiler_driver = select_source_driver(source_json->valuestring);
 
     char *argv[MAX_COMPILER_ARGS];
     char task_include_paths[MAX_TASK_FLAGS][512];
     int task_include_count = 0;
     int argc = 0;
-    argv[argc++] = "gcc";
+    argv[argc++] = (char *)compiler_driver;
 
     int flag_count = cJSON_GetArraySize(flags_json);
     if (flag_count > MAX_TASK_FLAGS) {
@@ -426,7 +448,7 @@ static int run_compile_task(
         return 0;
     }
 
-    // Fork and exec GCC with the provided arguments, then wait for it to finish and capture the exit code.
+    // Fork and exec the compiler with the provided arguments, then wait for it to finish and capture the exit code.
     pid_t pid = fork();
     if (pid < 0) {
         close(pipefd[0]);
@@ -436,7 +458,7 @@ static int run_compile_task(
         return 0;
     }
 
-    // In the child process, replace the image with GCC.
+    // In the child process, replace the image with the compiler driver.
     if (pid == 0) {
         close(pipefd[0]); // Child does not read
 
@@ -447,7 +469,7 @@ static int run_compile_task(
         }
 
         close(pipefd[1]);
-        execvp("gcc", argv);
+        execvp(compiler_driver, argv);
         _exit(127);
     }
 
@@ -464,19 +486,21 @@ static int run_compile_task(
         return 0;
     }
 
-    // Check if GCC exited normally and capture the exit code. Construct a human-readable status message based on the result.
+    // Check if the compiler exited normally and capture the exit code. Construct a human-readable status message based on the result.
     if (WIFEXITED(status)) {
         *exit_code_out = WEXITSTATUS(status);
         if (*exit_code_out == 0) {
-            snprintf(status_message, status_message_size, "Compiled %s -> %s", source, object);
+            snprintf(status_message, status_message_size, "Compiled %s -> %s with %s",
+                source, object, compiler_driver);
             return 1;
         }
 
-        snprintf(status_message, status_message_size, "gcc failed for %s with exit code %d", source, *exit_code_out);
+        snprintf(status_message, status_message_size, "%s failed for %s with exit code %d",
+            compiler_driver, source, *exit_code_out);
         return 0;
     }
 
-    snprintf(status_message, status_message_size, "gcc terminated abnormally for %s", source);
+    snprintf(status_message, status_message_size, "%s terminated abnormally for %s", compiler_driver, source);
     *exit_code_out = 1;
     return 0;
 }
