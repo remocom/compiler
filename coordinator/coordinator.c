@@ -96,50 +96,20 @@ static int collect_source_dependencies(
     size_t error_buf_size
 ) {
     const char *compiler_driver = remocom_select_source_driver(task->source_path);
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        snprintf(error_buf, error_buf_size, "pipe() failed while scanning dependencies");
-        return 0;
+    char *argv[MAX_FLAGS + 4];
+    int argc = 0;
+    argv[argc++] = (char *)compiler_driver;
+    for (int i = 0; i < task->flag_count; i++) {
+        argv[argc++] = (char *)task->flags[i];
     }
+    argv[argc++] = "-MM";
+    argv[argc++] = (char *)task->source_path;
+    argv[argc] = NULL;
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        snprintf(error_buf, error_buf_size, "fork() failed while scanning dependencies");
-        return 0;
-    }
-
-    if (pid == 0) {
-        close(pipefd[0]);
-        if (dup2(pipefd[1], STDOUT_FILENO) < 0 || dup2(pipefd[1], STDERR_FILENO) < 0) {
-            close(pipefd[1]);
-            _exit(127);
-        }
-        close(pipefd[1]);
-
-        char *argv[MAX_FLAGS + 4];
-        int argc = 0;
-        argv[argc++] = (char *)compiler_driver;
-        for (int i = 0; i < task->flag_count; i++) {
-            argv[argc++] = (char *)task->flags[i];
-        }
-        argv[argc++] = "-MM";
-        argv[argc++] = (char *)task->source_path;
-        argv[argc] = NULL;
-
-        execvp(compiler_driver, argv);
-        _exit(127);
-    }
-
-    close(pipefd[1]);
-
-    char output[DEPENDENCY_OUTPUT_SIZE];
-    int read_ok = remocom_read_process_output(pipefd[0], output, sizeof(output));
-    close(pipefd[0]);
-
+    char output[DEPENDENCY_OUTPUT_SIZE] = {0};
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0 || !read_ok || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (!remocom_run_process_capture(argv, output, sizeof(output), &status) ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         snprintf(error_buf, error_buf_size, "Dependency scan failed for %s with %s: %s",
             task->source_path, compiler_driver, output);
         return 0;
@@ -147,7 +117,12 @@ static int collect_source_dependencies(
 
     char *deps = strchr(output, ':');
     if (deps == NULL) {
-        snprintf(error_buf, error_buf_size, "Dependency scan output missing ':' for %s", task->source_path);
+        snprintf(
+            error_buf,
+            error_buf_size,
+            "Dependency scan output missing ':' for %s",
+            task->source_path
+        );
         return 0;
     }
 
@@ -166,7 +141,12 @@ static int collect_source_dependencies(
         if (token[0] != '\0' && strcmp(token, "\\") != 0) {
             const char *kind = strcmp(token, task->source_path) == 0 ? "source" : "header";
             if (!add_transfer_file(transfer_files, transfer_paths, transfer_file_count, token, kind)) {
-                snprintf(error_buf, error_buf_size, "Too many dependency files for %s", task->source_path);
+                snprintf(
+                    error_buf,
+                    error_buf_size,
+                    "Too many dependency files for %s",
+                    task->source_path
+                );
                 return 0;
             }
         }
@@ -179,7 +159,8 @@ static int collect_source_dependencies(
 /// @brief Represents the status of a worker node, which can be either dead or alive.
 typedef enum { dead, alive } NodeStatus;
 
-/// @brief Represents a worker node in the system, containing its ID, socket, IP address, last heartbeat timestamp, and status (alive or dead).
+/// @brief Represents a worker node in the system, containing its ID, socket, IP address,
+/// last heartbeat timestamp, and status (alive or dead).
 typedef struct {
     int nodeID;
     int socketID;
@@ -535,65 +516,26 @@ static int run_link_step(void) {
     }
     write_linker_log(linker_log, " -o %s\n\n", build_manifest.output);
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        log_event("[ERROR] pipe() failed while linking output %s\n", build_manifest.output);
-        write_linker_log(linker_log, "error=pipe() failed: %s\n", strerror(errno));
-        if (linker_log != NULL) {
-            fclose(linker_log);
-        }
-        return 0;
-    }
-
     log_event("LINK STARTED | output=%s | objects=%d\n", build_manifest.output, original_task_count);
     write_linker_log(linker_log, "status=started\n");
     printf("Linking %d object files into %s\n", original_task_count, build_manifest.output);
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        log_event("[ERROR] fork() failed while linking output %s\n", build_manifest.output);
-        write_linker_log(linker_log, "error=fork() failed: %s\n", strerror(errno));
-        if (linker_log != NULL) {
-            fclose(linker_log);
-        }
-        return 0;
+    char *argv[MAX_TASKS + MAX_FLAGS + 4];
+    int argc = 0;
+    argv[argc++] = (char *)linker_driver;
+    for (int i = 0; i < original_task_count; i++) {
+        argv[argc++] = task_queue[i].object_path;
     }
-
-    if (pid == 0) {
-        close(pipefd[0]);
-        if (dup2(pipefd[1], STDOUT_FILENO) < 0 || dup2(pipefd[1], STDERR_FILENO) < 0) {
-            close(pipefd[1]);
-            _exit(127);
-        }
-        close(pipefd[1]);
-
-        char *argv[MAX_TASKS + MAX_FLAGS + 4];
-        int argc = 0;
-        argv[argc++] = (char *)linker_driver;
-        for (int i = 0; i < original_task_count; i++) {
-            argv[argc++] = task_queue[i].object_path;
-        }
-        for (int i = 0; i < build_manifest.flag_count; i++) {
-            argv[argc++] = build_manifest.flags[i];
-        }
-        argv[argc++] = "-o";
-        argv[argc++] = build_manifest.output;
-        argv[argc] = NULL;
-
-        execvp(linker_driver, argv);
-        _exit(127);
+    for (int i = 0; i < build_manifest.flag_count; i++) {
+        argv[argc++] = build_manifest.flags[i];
     }
+    argv[argc++] = "-o";
+    argv[argc++] = build_manifest.output;
+    argv[argc] = NULL;
 
-    close(pipefd[1]);
-
-    char output[LINK_OUTPUT_SIZE];
-    int read_ok = remocom_read_process_output(pipefd[0], output, sizeof(output));
-    close(pipefd[0]);
-
+    char output[LINK_OUTPUT_SIZE] = {0};
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0 || !read_ok) {
+    if (!remocom_run_process_capture(argv, output, sizeof(output), &status)) {
         log_event("[ERROR] Link process failed while producing %s\n", build_manifest.output);
         write_linker_log(linker_log, "status=failed\n");
         write_linker_log(linker_log, "error=link process failed");
