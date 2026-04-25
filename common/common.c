@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define REMOCOM_IO_CHUNK_SIZE 65536
@@ -173,6 +174,75 @@ int remocom_read_process_output(int read_fd, char *output, size_t output_size) {
         output[total] = '\0';
     }
     return ok;
+}
+
+/// @brief Runs a child process, capturing stdout/stderr into a bounded buffer.
+/// @param argv Null-terminated argument vector. argv[0] is used as the executable.
+/// @param output Buffer for captured stdout/stderr.
+/// @param output_size Size of output buffer.
+/// @param wait_status_out Destination for the raw waitpid status.
+/// @return 1 if the child was launched, captured, and waited for successfully; 0 otherwise.
+int remocom_run_process_capture(
+    char *const argv[],
+    char *output,
+    size_t output_size,
+    int *wait_status_out
+) {
+    if (argv == NULL || argv[0] == NULL || wait_status_out == NULL) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (output != NULL && output_size > 0) {
+        output[0] = '\0';
+    }
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        int saved_errno = errno;
+        close(pipefd[0]);
+        close(pipefd[1]);
+        errno = saved_errno;
+        return 0;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 || dup2(pipefd[1], STDERR_FILENO) < 0) {
+            close(pipefd[1]);
+            _exit(127);
+        }
+        close(pipefd[1]);
+
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+
+    int read_ok = remocom_read_process_output(pipefd[0], output, output_size);
+    int read_errno = errno;
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        return 0;
+    }
+
+    if (!read_ok) {
+        errno = read_errno;
+        return 0;
+    }
+
+    *wait_status_out = status;
+    return 1;
 }
 
 /// @brief Sends all data from a buffer to a file descriptor.

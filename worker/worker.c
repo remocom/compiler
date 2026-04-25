@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -354,57 +355,15 @@ static int run_compile_task(
     argv[argc++] = (char *)local_object;
     argv[argc] = NULL;
 
-    /*
-     * Create pipe to capture stdout and stderr of child process
-     * pipefd[0] = read end
-     * pipefd[1] = write end
-    */
-    int pipefd[2];
-    if(pipe(pipefd) < 0){
-        snprintf(status_message, status_message_size, "pipe() failed");
-        *exit_code_out = 1;
-        return 0;
-    }
-
-    // Fork and exec the compiler with the provided arguments, then wait for it to finish and capture the exit code.
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        snprintf(status_message, status_message_size, "fork() failed");
-        *exit_code_out = 1;
-        return 0;
-    }
-
-    // In the child process, replace the image with the compiler driver.
-    if (pid == 0) {
-        close(pipefd[0]); // Child does not read
-
-         // Child: send both stdout and stderr into the same pipe
-        if((dup2(pipefd[1], STDOUT_FILENO) < 0 || dup2(pipefd[1], STDERR_FILENO) < 0)){
-            close(pipefd[1]);
-            _exit(127);
-        }
-
-        close(pipefd[1]);
-        execvp(compiler_driver, argv);
-        _exit(127);
-    }
-
-    close(pipefd[1]); // Parent does not write
-
-    remocom_read_process_output(pipefd[0], compiler_output, compiler_output_size);
-    close(pipefd[0]);
-
-    // In the parent process, wait for the child to finish and capture its exit status.
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        snprintf(status_message, status_message_size, "waitpid() failed");
+    if (!remocom_run_process_capture(argv, compiler_output, compiler_output_size, &status)) {
+        snprintf(status_message, status_message_size, "Compiler process failed: %s", strerror(errno));
         *exit_code_out = 1;
         return 0;
     }
 
-    // Check if the compiler exited normally and capture the exit code. Construct a human-readable status message based on the result.
+    // Check if the compiler exited normally and capture the exit code.
+    // Construct a human-readable status message based on the result.
     if (WIFEXITED(status)) {
         *exit_code_out = WEXITSTATUS(status);
         if (*exit_code_out == 0) {
