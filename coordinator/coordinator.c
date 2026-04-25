@@ -327,14 +327,14 @@ static int handle_task_result(int client_fd, int node_id, cJSON *payload) {
 
     // Extract fields from payload with validation.
     // If any field is missing or of the wrong type, log the issue but attempt to print whatever information is available.
-    cJSON *source = cJSON_GetObjectItem(payload, "source");
-    cJSON *object = cJSON_GetObjectItem(payload, "object");
-    cJSON *status = cJSON_GetObjectItem(payload, "status");
-    cJSON *exit_code = cJSON_GetObjectItem(payload, "exit_code");
-    cJSON *message = cJSON_GetObjectItem(payload, "message");
-    cJSON *output = cJSON_GetObjectItem(payload, "compiler_output");
-    cJSON *has_object = cJSON_GetObjectItem(payload, "has_object");
-    cJSON *object_size = cJSON_GetObjectItem(payload, "object_size");
+    cJSON *source = cJSON_GetObjectItem(payload, TASK_KEY_SOURCE);
+    cJSON *object = cJSON_GetObjectItem(payload, TASK_KEY_OBJECT);
+    cJSON *status = cJSON_GetObjectItem(payload, TASK_KEY_STATUS);
+    cJSON *exit_code = cJSON_GetObjectItem(payload, TASK_KEY_EXIT_CODE);
+    cJSON *message = cJSON_GetObjectItem(payload, TASK_KEY_MESSAGE);
+    cJSON *output = cJSON_GetObjectItem(payload, TASK_KEY_COMPILER_OUTPUT);
+    cJSON *has_object = cJSON_GetObjectItem(payload, TASK_KEY_HAS_OBJECT);
+    cJSON *object_size = cJSON_GetObjectItem(payload, TASK_KEY_OBJECT_SIZE);
 
     const char *source_str = cJSON_IsString(source) ? source->valuestring : "<unknown>";
     const char *object_str = cJSON_IsString(object) ? object->valuestring : "<unknown>";
@@ -342,7 +342,7 @@ static int handle_task_result(int client_fd, int node_id, cJSON *payload) {
     int exit_code_val = cJSON_IsNumber(exit_code) ? exit_code->valueint : -1;
     const char *message_str = cJSON_IsString(message) ? message->valuestring : "<none>";
     int should_receive_object = cJSON_IsBool(has_object) && cJSON_IsTrue(has_object) && cJSON_IsString(object);
-    int compile_succeeded = strcmp(status_str, "success") == 0 && exit_code_val == 0;
+    int compile_succeeded = strcmp(status_str, TASK_STATUS_SUCCESS) == 0 && exit_code_val == 0;
     int object_received = 0;
     uint64_t object_size_val = 0;
     int has_object_size = remocom_parse_u64_string(object_size, &object_size_val);
@@ -428,7 +428,7 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
 
         if (handshake_ok) {
             remocom_worker_registry_mark_handshake_completed(client_fd);
-            send_json_message(client_fd, MSG_TYPE_HANDSHAKE_ACK, "Handshake accepted");
+            send_json_message(client_fd, MSG_TYPE_HANDSHAKE_ACK, MSG_PAYLOAD_HANDSHAKE_ACCEPTED);
             log_event("HANDSHAKE ACCEPTED Node %d\n", node_id);
             return;
         }
@@ -440,19 +440,19 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
     }
 
     if (!worker.handshake_completed) {
-        send_json_message(client_fd, MSG_TYPE_HANDSHAKE_REQUIRED, "Handshake required before registration");
+        send_json_message(client_fd, MSG_TYPE_HANDSHAKE_REQUIRED, MSG_PAYLOAD_HANDSHAKE_REQUIRED);
         return;
     }
 
     // Handle heartbeat immediately to keep worker alive in the system.
-    if (strcmp(type->valuestring, "heartbeat") == 0) {
+    if (strcmp(type->valuestring, MSG_TYPE_HEARTBEAT) == 0) {
         remocom_worker_registry_update_heartbeat(client_fd);
         return;
     }
 
     // Handle other message types outside the lock.
-    if (strcmp(type->valuestring, "register") == 0) {
-        send_json_message(client_fd, "ack", "Worker registered"); // Acknowledge registration.
+    if (strcmp(type->valuestring, MSG_TYPE_REGISTER) == 0) {
+        send_json_message(client_fd, MSG_TYPE_ACK, MSG_PAYLOAD_WORKER_REGISTERED);
     } else if (strcmp(type->valuestring, MSG_TYPE_TASK_REQUEST) == 0) {
         remocom_assign_task_to_worker(&task_dispatch, client_fd, node_id);
     } else if (strcmp(type->valuestring, MSG_TYPE_TASK_RESULT) == 0) {
@@ -467,7 +467,7 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
         }
 
     } else {
-        send_json_message(client_fd, "unknown", "Unknown message type");
+        send_json_message(client_fd, MSG_TYPE_UNKNOWN, MSG_PAYLOAD_UNKNOWN_TYPE);
     }
 }
 
@@ -555,8 +555,8 @@ static void *handle_worker(void *arg) {
             return NULL;
         }
 
-        cJSON *type = cJSON_GetObjectItem(msg, "type");
-        cJSON *payload = cJSON_GetObjectItem(msg, "payload");
+        cJSON *type = cJSON_GetObjectItem(msg, RPC_KEY_TYPE);
+        cJSON *payload = cJSON_GetObjectItem(msg, RPC_KEY_PAYLOAD);
 
         // Make sure message has the required fields in string form.
         if (type == NULL || payload == NULL || !cJSON_IsString(type)) {

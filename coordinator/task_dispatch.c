@@ -132,7 +132,8 @@ static int collect_source_dependencies(
     char *token = strtok(deps, " ");
     while (token != NULL) {
         if (token[0] != '\0' && strcmp(token, "\\") != 0) {
-            const char *kind = strcmp(token, task->source_path) == 0 ? "source" : "header";
+            const char *kind = strcmp(token, task->source_path) == 0 ?
+                TASK_FILE_KIND_SOURCE : TASK_FILE_KIND_HEADER;
             if (!add_transfer_file(transfer_files, transfer_paths, transfer_file_count, token, kind)) {
                 snprintf(error_buf, error_buf_size, "Too many dependency files for %s", task->source_path);
                 return 0;
@@ -192,7 +193,13 @@ static int prepare_transfer_files(
 ) {
     *transfer_file_count = 0;
 
-    if (!add_transfer_file(transfer_files, transfer_paths, transfer_file_count, task->source_path, "source")) {
+    if (!add_transfer_file(
+        transfer_files,
+        transfer_paths,
+        transfer_file_count,
+        task->source_path,
+        TASK_FILE_KIND_SOURCE
+    )) {
         snprintf(error_buf, error_buf_size, "Unable to queue source transfer");
         task_dispatch_logf(ctx, "[ERROR] Unable to queue source transfer | Node %d | Source: %s\n",
             node_id, task->source_path);
@@ -207,7 +214,7 @@ static int prepare_transfer_files(
 
     for (int i = 0; i < ctx->manifest->header_count; i++) {
         if (!add_transfer_file(transfer_files, transfer_paths, transfer_file_count,
-            ctx->manifest->headers[i], "header")) {
+            ctx->manifest->headers[i], TASK_FILE_KIND_HEADER)) {
             snprintf(error_buf, error_buf_size, "Too many transfer files");
             task_dispatch_logf(ctx, "[ERROR] Too many transfer files for task | Node %d | Source: %s\n",
                 node_id, task->source_path);
@@ -242,23 +249,23 @@ static cJSON *build_task_assignment_payload(
         return NULL;
     }
 
-    cJSON_AddStringToObject(payload, "source", task->source_path);
-    cJSON_AddStringToObject(payload, "object", task->object_path);
-    cJSON_AddStringToObject(payload, "output", task->build_output);
+    cJSON_AddStringToObject(payload, TASK_KEY_SOURCE, task->source_path);
+    cJSON_AddStringToObject(payload, TASK_KEY_OBJECT, task->object_path);
+    cJSON_AddStringToObject(payload, TASK_KEY_OUTPUT, task->build_output);
 
-    cJSON *files = cJSON_AddArrayToObject(payload, "files");
+    cJSON *files = cJSON_AddArrayToObject(payload, TASK_KEY_FILES);
     for (int i = 0; i < transfer_file_count; i++) {
         char size_text[32];
         snprintf(size_text, sizeof(size_text), "%" PRIu64, transfer_files[i].size);
 
         cJSON *file_payload = cJSON_CreateObject();
-        cJSON_AddStringToObject(file_payload, "path", transfer_files[i].path);
-        cJSON_AddStringToObject(file_payload, "kind", transfer_files[i].kind);
-        cJSON_AddStringToObject(file_payload, "size", size_text);
+        cJSON_AddStringToObject(file_payload, TASK_KEY_PATH, transfer_files[i].path);
+        cJSON_AddStringToObject(file_payload, TASK_KEY_KIND, transfer_files[i].kind);
+        cJSON_AddStringToObject(file_payload, TASK_KEY_SIZE, size_text);
         cJSON_AddItemToArray(files, file_payload);
     }
 
-    cJSON *flags = cJSON_AddArrayToObject(payload, "flags");
+    cJSON *flags = cJSON_AddArrayToObject(payload, TASK_KEY_FLAGS);
     for (int i = 0; i < task->flag_count; i++) {
         cJSON_AddItemToArray(flags, cJSON_CreateString(task->flags[i]));
     }
@@ -307,7 +314,7 @@ void remocom_enqueue_task_for_reassign(TaskDispatchContext *ctx, const CompileTa
 void remocom_assign_task_to_worker(TaskDispatchContext *ctx, int client_fd, int node_id) {
     CompileTask task;
     if (!pop_next_task(ctx, &task)) {
-        remocom_send_json_message(client_fd, MSG_TYPE_NO_TASK, "No tasks available");
+        remocom_send_json_message(client_fd, MSG_TYPE_NO_TASK, MSG_PAYLOAD_NO_TASK);
         return;
     }
 
@@ -319,7 +326,7 @@ void remocom_assign_task_to_worker(TaskDispatchContext *ctx, int client_fd, int 
     if (!prepare_transfer_files(ctx, &task, node_id, transfer_files, transfer_paths,
         &transfer_file_count, error_message, sizeof(error_message))) {
         requeue_task_for_prepare_failure(ctx, &task);
-        remocom_send_json_message(client_fd, "task_error", error_message);
+        remocom_send_json_message(client_fd, MSG_TYPE_TASK_ERROR, error_message);
         return;
     }
 

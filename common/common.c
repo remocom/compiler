@@ -270,8 +270,8 @@ int remocom_send_json_with_payload(int fd, const char *type, cJSON *payload) {
         return 0;
     }
 
-    cJSON_AddStringToObject(msg, "type", type);
-    cJSON_AddItemToObject(msg, "payload", payload);
+    cJSON_AddStringToObject(msg, RPC_KEY_TYPE, type);
+    cJSON_AddItemToObject(msg, RPC_KEY_PAYLOAD, payload);
 
     char *json_string = cJSON_PrintUnformatted(msg);
     cJSON_Delete(msg);

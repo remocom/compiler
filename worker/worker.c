@@ -174,7 +174,7 @@ static void discard_task_files(int sock_fd, cJSON *files) {
     int file_count = cJSON_GetArraySize(files);
     for (int i = 0; i < file_count; i++) {
         cJSON *file_item = cJSON_GetArrayItem(files, i);
-        cJSON *size_json = cJSON_GetObjectItem(file_item, "size");
+        cJSON *size_json = cJSON_GetObjectItem(file_item, TASK_KEY_SIZE);
         uint64_t file_size = 0;
         if (remocom_parse_u64_string(size_json, &file_size)) {
             discard_stream(sock_fd, file_size);
@@ -203,8 +203,8 @@ static int receive_task_files(int sock_fd, cJSON *files, const char *task_dir, c
     int file_count = cJSON_GetArraySize(files);
     for (int i = 0; i < file_count; i++) {
         cJSON *file_item = cJSON_GetArrayItem(files, i);
-        cJSON *path_json = cJSON_GetObjectItem(file_item, "path");
-        cJSON *size_json = cJSON_GetObjectItem(file_item, "size");
+        cJSON *path_json = cJSON_GetObjectItem(file_item, TASK_KEY_PATH);
+        cJSON *size_json = cJSON_GetObjectItem(file_item, TASK_KEY_SIZE);
         uint64_t file_size = 0;
 
         if (!cJSON_IsObject(file_item) || !cJSON_IsString(path_json) ||
@@ -250,7 +250,7 @@ static int perform_handshake(int sock_fd, char *buffer) {
         return 0;
     }
 
-    cJSON *type = cJSON_GetObjectItem(msg, "type");
+    cJSON *type = cJSON_GetObjectItem(msg, RPC_KEY_TYPE);
     int accepted = cJSON_IsString(type) && strcmp(type->valuestring, MSG_TYPE_HANDSHAKE_ACK) == 0;
 
     if (!accepted) {
@@ -272,7 +272,7 @@ static int perform_handshake(int sock_fd, char *buffer) {
 static void register_with_coordinator(int sock_fd, char *buffer) {
     (void)buffer;
     // send initial register message so coordinator knows this worker joined
-    send_json_message(sock_fd, "register", "Hello from worker");
+    send_json_message(sock_fd, MSG_TYPE_REGISTER, MSG_PAYLOAD_WORKER_REGISTER);
 
     cJSON *msg = remocom_recv_json_message(sock_fd);
     if (msg != NULL) {
@@ -308,9 +308,9 @@ static void set_task_status(WorkerTaskExecution *task, const char *format, ...) 
 /// @param task The task execution structure to initialize.
 /// @return 1 if parsing is successful, 0 otherwise.
 static int parse_task_assignment_payload(WorkerTaskExecution *task) {
-    task->source_json = cJSON_GetObjectItem(task->payload, "source");
-    task->object_json = cJSON_GetObjectItem(task->payload, "object");
-    task->files_json = cJSON_GetObjectItem(task->payload, "files");
+    task->source_json = cJSON_GetObjectItem(task->payload, TASK_KEY_SOURCE);
+    task->object_json = cJSON_GetObjectItem(task->payload, TASK_KEY_OBJECT);
+    task->files_json = cJSON_GetObjectItem(task->payload, TASK_KEY_FILES);
 
     if (cJSON_IsString(task->source_json)) {
         snprintf(task->source, sizeof(task->source), "%s", task->source_json->valuestring);
@@ -409,7 +409,7 @@ static int build_compile_argv(
     char task_include_paths[MAX_TASK_FLAGS][WORKER_PATH_SIZE],
     const char **compiler_driver_out
 ) {
-    cJSON *flags_json = cJSON_GetObjectItem(task->payload, "flags");
+    cJSON *flags_json = cJSON_GetObjectItem(task->payload, TASK_KEY_FLAGS);
 
     if (!cJSON_IsString(task->source_json) || !cJSON_IsString(task->object_json) || !cJSON_IsArray(flags_json)) {
         set_task_status(task, "Task payload missing source/object/flags");
@@ -523,14 +523,14 @@ static void send_task_result(int sock_fd, const char *source, const char *object
     snprintf(object_size_text, sizeof(object_size_text), "%" PRIu64, object_size);
 
     cJSON *payload = cJSON_CreateObject();
-    cJSON_AddStringToObject(payload, "source", source);
-    cJSON_AddStringToObject(payload, "object", object);
-    cJSON_AddStringToObject(payload, "status", status);
-    cJSON_AddNumberToObject(payload, "exit_code", exit_code);
-    cJSON_AddStringToObject(payload, "message", message);
-    cJSON_AddStringToObject(payload, "compiler_output", output);
-    cJSON_AddBoolToObject(payload, "has_object", has_object);
-    cJSON_AddStringToObject(payload, "object_size", object_size_text);
+    cJSON_AddStringToObject(payload, TASK_KEY_SOURCE, source);
+    cJSON_AddStringToObject(payload, TASK_KEY_OBJECT, object);
+    cJSON_AddStringToObject(payload, TASK_KEY_STATUS, status);
+    cJSON_AddNumberToObject(payload, TASK_KEY_EXIT_CODE, exit_code);
+    cJSON_AddStringToObject(payload, TASK_KEY_MESSAGE, message);
+    cJSON_AddStringToObject(payload, TASK_KEY_COMPILER_OUTPUT, output);
+    cJSON_AddBoolToObject(payload, TASK_KEY_HAS_OBJECT, has_object);
+    cJSON_AddStringToObject(payload, TASK_KEY_OBJECT_SIZE, object_size_text);
 
     send_json_with_payload(sock_fd, MSG_TYPE_TASK_RESULT, payload);
     if (has_object) {
@@ -546,7 +546,7 @@ static void send_task_execution_result(int sock_fd, const WorkerTaskExecution *t
         sock_fd,
         task->source,
         task->object,
-        task->success ? "success" : "failure",
+        task->success ? TASK_STATUS_SUCCESS : TASK_STATUS_FAILURE,
         task->exit_code,
         task->status_message,
         task->compiler_output,
@@ -585,7 +585,7 @@ static void process_task_assignment(int sock_fd, cJSON *payload) {
 /// @return 1 if worker should continue requesting tasks, 0 otherwise.
 static int request_and_process_task(int sock_fd, char *buffer) {
     (void)buffer;
-    send_json_message(sock_fd, MSG_TYPE_TASK_REQUEST, "requesting work");
+    send_json_message(sock_fd, MSG_TYPE_TASK_REQUEST, MSG_PAYLOAD_TASK_REQUEST);
 
     cJSON *msg = remocom_recv_json_message(sock_fd);
     if (msg == NULL) {
@@ -593,8 +593,8 @@ static int request_and_process_task(int sock_fd, char *buffer) {
         return 0;
     }
 
-    cJSON *type = cJSON_GetObjectItem(msg, "type");
-    cJSON *payload = cJSON_GetObjectItem(msg, "payload");
+    cJSON *type = cJSON_GetObjectItem(msg, RPC_KEY_TYPE);
+    cJSON *payload = cJSON_GetObjectItem(msg, RPC_KEY_PAYLOAD);
     if (!cJSON_IsString(type) || payload == NULL) {
         cJSON_Delete(msg);
         return 0;
@@ -606,7 +606,7 @@ static int request_and_process_task(int sock_fd, char *buffer) {
         return 0;
     }
 
-    if (strcmp(type->valuestring, "task_error") == 0) {
+    if (strcmp(type->valuestring, MSG_TYPE_TASK_ERROR) == 0) {
         char *response = cJSON_PrintUnformatted(payload);
         printf("Coordinator could not prepare task: %s\n", response != NULL ? response : "<unprintable>");
         free(response);
@@ -642,7 +642,7 @@ static void heartbeat_loop(int sock_fd) {
         sleep(5); // every 5 seconds send heartbeat
 
         // heartbeat message tells coordinator this worker is still alive
-        send_json_message(sock_fd, "heartbeat", "alive");
+        send_json_message(sock_fd, MSG_TYPE_HEARTBEAT, MSG_PAYLOAD_HEARTBEAT_ALIVE);
         printf("Heartbeat sent\n");
     }
 }
