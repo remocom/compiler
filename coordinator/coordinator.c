@@ -46,8 +46,6 @@ typedef struct {
     uint64_t size;
 } TransferFile;
 
-static const char *select_source_driver(const char *source_path);
-
 /// @brief Adds a file to the list of files to be transferred.
 /// @param transfer_files Array of TransferFile structs being built for the current task assignment.
 /// @param transfer_paths Array of strings containing the paths of the files to be transferred.
@@ -80,74 +78,6 @@ static int add_transfer_file(
     return 1;
 }
 
-/// @brief Reads the output of a dependency scan from a file descriptor.
-/// @param read_fd The file descriptor from which to read the output.
-/// @param output A buffer to store the read output.
-/// @param output_size The size of the output buffer.
-/// @return 1 if successful, 0 otherwise.
-static int read_dependency_output(int read_fd, char *output, size_t output_size) {
-    size_t total = 0;
-
-    while (total + 1 < output_size) {
-        ssize_t n = read(read_fd, output + total, output_size - total - 1);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return 0;
-        }
-        if (n == 0) {
-            break;
-        }
-        total += (size_t)n;
-    }
-
-    output[total] = '\0';
-    return 1;
-}
-
-/// @brief Captures child-process output and drains any bytes beyond the destination size.
-/// @param read_fd The file descriptor from which to read child stdout/stderr.
-/// @param output A buffer to store the captured output prefix.
-/// @param output_size The size of the output buffer.
-/// @return 1 if the stream was read successfully, 0 otherwise.
-static int read_process_output(int read_fd, char *output, size_t output_size) {
-    size_t total = 0;
-    int ok = 1;
-
-    while (1) {
-        char discard[512];
-        char *target = discard;
-        size_t capacity = sizeof(discard);
-
-        if (output_size > 0 && total + 1 < output_size) {
-            target = output + total;
-            capacity = output_size - total - 1;
-        }
-
-        ssize_t n = read(read_fd, target, capacity);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            ok = 0;
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-
-        if (target == output + total) {
-            total += (size_t)n;
-        }
-    }
-
-    if (output_size > 0) {
-        output[total] = '\0';
-    }
-    return ok;
-}
-
 /// @brief Collects the source dependencies for a given compile task.
 /// @param task The compile task for which to collect dependencies.
 /// @param transfer_files Array of TransferFile structs being built for the current task assignment.
@@ -165,7 +95,7 @@ static int collect_source_dependencies(
     char *error_buf,
     size_t error_buf_size
 ) {
-    const char *compiler_driver = select_source_driver(task->source_path);
+    const char *compiler_driver = remocom_select_source_driver(task->source_path);
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         snprintf(error_buf, error_buf_size, "pipe() failed while scanning dependencies");
@@ -205,7 +135,7 @@ static int collect_source_dependencies(
     close(pipefd[1]);
 
     char output[DEPENDENCY_OUTPUT_SIZE];
-    int read_ok = read_dependency_output(pipefd[0], output, sizeof(output));
+    int read_ok = remocom_read_process_output(pipefd[0], output, sizeof(output));
     close(pipefd[0]);
 
     int status = 0;
@@ -309,22 +239,6 @@ static int change_to_manifest_directory(const char *manifest_path, char *error_b
     return 1;
 }
 
-static int parse_u64_string(cJSON *value, uint64_t *out) {
-    if (!cJSON_IsString(value)) {
-        return 0;
-    }
-
-    char *end = NULL;
-    errno = 0;
-    unsigned long long parsed = strtoull(value->valuestring, &end, 10);
-    if (errno != 0 || end == value->valuestring || *end != '\0') {
-        return 0;
-    }
-
-    *out = (uint64_t)parsed;
-    return 1;
-}
-
 /// @brief Builds a default object-file path from a source path.
 /// @param source_path Source path from manifest.
 /// @param object_path Destination for derived object path.
@@ -344,32 +258,11 @@ static int derive_object_path(const char *source_path, char *object_path, size_t
     return needed > 0 && (size_t)needed < object_path_size;
 }
 
-/// @brief Checks whether a source path should use the C++ compiler driver.
-/// @param source_path Source path from the manifest.
-/// @return 1 for common C++ source extensions, 0 otherwise.
-static int is_cpp_source_path(const char *source_path) {
-    const char *extension = strrchr(source_path, '.');
-    if (extension == NULL) {
-        return 0;
-    }
-
-    return strcmp(extension, ".cpp") == 0 ||
-        strcmp(extension, ".cc") == 0 ||
-        strcmp(extension, ".cxx") == 0 ||
-        strcmp(extension, ".C") == 0;
-}
-
-/// @brief Selects the compiler driver for a source file.
-/// @return "g++" for C++ sources, otherwise "gcc".
-static const char *select_source_driver(const char *source_path) {
-    return is_cpp_source_path(source_path) ? "g++" : "gcc";
-}
-
 /// @brief Selects the linker driver for the manifest's object files.
 /// @return "g++" when any original source is C++, otherwise "gcc".
 static const char *select_linker_driver(void) {
     for (int i = 0; i < original_task_count; i++) {
-        if (strcmp(select_source_driver(task_queue[i].source_path), "g++") == 0) {
+        if (strcmp(remocom_select_source_driver(task_queue[i].source_path), "g++") == 0) {
             return "g++";
         }
     }
@@ -696,7 +589,7 @@ static int run_link_step(void) {
     close(pipefd[1]);
 
     char output[LINK_OUTPUT_SIZE];
-    int read_ok = read_process_output(pipefd[0], output, sizeof(output));
+    int read_ok = remocom_read_process_output(pipefd[0], output, sizeof(output));
     close(pipefd[0]);
 
     int status = 0;
@@ -917,7 +810,7 @@ static int handle_task_result(int client_fd, int node_id, cJSON *payload) {
     int compile_succeeded = strcmp(status_str, "success") == 0 && exit_code_val == 0;
     int object_received = 0;
     uint64_t object_size_val = 0;
-    int has_object_size = parse_u64_string(object_size, &object_size_val);
+    int has_object_size = remocom_parse_u64_string(object_size, &object_size_val);
 
     log_event(
         "TASK RESULT | Node %d | source=%s | object=%s | status=%s | exit_code=%d | message=%s\n",
