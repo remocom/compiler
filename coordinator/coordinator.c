@@ -26,6 +26,8 @@
 #define MAX_FLAGS REMOCOM_MAX_FLAGS
 #define MAX_TRANSFER_FILES (REMOCOM_MAX_HEADERS + 1)
 #define DEPENDENCY_OUTPUT_SIZE 65536
+#define LINK_OUTPUT_SIZE 65536
+#define LINKER_LOG_PATH "linker.log"
 
 /// @brief Represents a compile task derived from the manifest, containing source/object paths, build output, and flags.
 typedef struct {
@@ -43,6 +45,8 @@ typedef struct {
     const char *kind;
     uint64_t size;
 } TransferFile;
+
+static const char *select_source_driver(const char *source_path);
 
 /// @brief Adds a file to the list of files to be transferred.
 /// @param transfer_files Array of TransferFile structs being built for the current task assignment.
@@ -102,6 +106,48 @@ static int read_dependency_output(int read_fd, char *output, size_t output_size)
     return 1;
 }
 
+/// @brief Captures child-process output and drains any bytes beyond the destination size.
+/// @param read_fd The file descriptor from which to read child stdout/stderr.
+/// @param output A buffer to store the captured output prefix.
+/// @param output_size The size of the output buffer.
+/// @return 1 if the stream was read successfully, 0 otherwise.
+static int read_process_output(int read_fd, char *output, size_t output_size) {
+    size_t total = 0;
+    int ok = 1;
+
+    while (1) {
+        char discard[512];
+        char *target = discard;
+        size_t capacity = sizeof(discard);
+
+        if (output_size > 0 && total + 1 < output_size) {
+            target = output + total;
+            capacity = output_size - total - 1;
+        }
+
+        ssize_t n = read(read_fd, target, capacity);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ok = 0;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+
+        if (target == output + total) {
+            total += (size_t)n;
+        }
+    }
+
+    if (output_size > 0) {
+        output[total] = '\0';
+    }
+    return ok;
+}
+
 /// @brief Collects the source dependencies for a given compile task.
 /// @param task The compile task for which to collect dependencies.
 /// @param transfer_files Array of TransferFile structs being built for the current task assignment.
@@ -119,6 +165,7 @@ static int collect_source_dependencies(
     char *error_buf,
     size_t error_buf_size
 ) {
+    const char *compiler_driver = select_source_driver(task->source_path);
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         snprintf(error_buf, error_buf_size, "pipe() failed while scanning dependencies");
@@ -143,7 +190,7 @@ static int collect_source_dependencies(
 
         char *argv[MAX_FLAGS + 4];
         int argc = 0;
-        argv[argc++] = "gcc";
+        argv[argc++] = (char *)compiler_driver;
         for (int i = 0; i < task->flag_count; i++) {
             argv[argc++] = (char *)task->flags[i];
         }
@@ -151,7 +198,7 @@ static int collect_source_dependencies(
         argv[argc++] = (char *)task->source_path;
         argv[argc] = NULL;
 
-        execvp("gcc", argv);
+        execvp(compiler_driver, argv);
         _exit(127);
     }
 
@@ -163,7 +210,8 @@ static int collect_source_dependencies(
 
     int status = 0;
     if (waitpid(pid, &status, 0) < 0 || !read_ok || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        snprintf(error_buf, error_buf_size, "Dependency scan failed for %s: %s", task->source_path, output);
+        snprintf(error_buf, error_buf_size, "Dependency scan failed for %s with %s: %s",
+            task->source_path, compiler_driver, output);
         return 0;
     }
 
@@ -220,15 +268,22 @@ static FILE *log_file;
 
 static CompileTask task_queue[MAX_TASKS];
 static int total_tasks = 0;
+static int original_task_count = 0;
 static int next_task_index = 0;
 static BuildManifest build_manifest;
+static int object_ready[MAX_TASKS];
+static int object_ready_count = 0;
+static int build_failed = 0;
+static int link_started = 0;
 
 static pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t build_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void send_json_message(int client_fd, const char *type_str, const char *payload_str);
 static void *handle_worker(void *arg);
+static void write_linker_log(FILE *linker_log, const char *format, ...);
 
 static int change_to_manifest_directory(const char *manifest_path, char *error_buf, size_t error_buf_size) {
     char manifest_copy[PATH_MAX];
@@ -289,6 +344,39 @@ static int derive_object_path(const char *source_path, char *object_path, size_t
     return needed > 0 && (size_t)needed < object_path_size;
 }
 
+/// @brief Checks whether a source path should use the C++ compiler driver.
+/// @param source_path Source path from the manifest.
+/// @return 1 for common C++ source extensions, 0 otherwise.
+static int is_cpp_source_path(const char *source_path) {
+    const char *extension = strrchr(source_path, '.');
+    if (extension == NULL) {
+        return 0;
+    }
+
+    return strcmp(extension, ".cpp") == 0 ||
+        strcmp(extension, ".cc") == 0 ||
+        strcmp(extension, ".cxx") == 0 ||
+        strcmp(extension, ".C") == 0;
+}
+
+/// @brief Selects the compiler driver for a source file.
+/// @return "g++" for C++ sources, otherwise "gcc".
+static const char *select_source_driver(const char *source_path) {
+    return is_cpp_source_path(source_path) ? "g++" : "gcc";
+}
+
+/// @brief Selects the linker driver for the manifest's object files.
+/// @return "g++" when any original source is C++, otherwise "gcc".
+static const char *select_linker_driver(void) {
+    for (int i = 0; i < original_task_count; i++) {
+        if (strcmp(select_source_driver(task_queue[i].source_path), "g++") == 0) {
+            return "g++";
+        }
+    }
+
+    return "gcc";
+}
+
 /// @brief Loads a subset of TOML manifest format for the [build] section.
 /// @param manifest_path Path to manifest file.
 /// @param manifest Parsed output manifest.
@@ -306,7 +394,12 @@ static int load_manifest_file(const char *manifest_path, BuildManifest *manifest
 /// @return 1 on success, 0 when queue/object path validation fails.
 static int build_compile_tasks_from_manifest(const BuildManifest *manifest, char *error_buf, size_t error_buf_size) {
     total_tasks = 0;
+    original_task_count = 0;
     next_task_index = 0;
+    object_ready_count = 0;
+    build_failed = 0;
+    link_started = 0;
+    memset(object_ready, 0, sizeof(object_ready));
 
     for (int i = 0; i < manifest->source_count; i++) {
         if (total_tasks >= MAX_TASKS) {
@@ -330,6 +423,7 @@ static int build_compile_tasks_from_manifest(const BuildManifest *manifest, char
         total_tasks++;
     }
 
+    original_task_count = total_tasks;
     return 1;
 }
 
@@ -434,6 +528,229 @@ static void log_event(const char *format, ...) {
 
     fflush(log_file);
     pthread_mutex_unlock(&log_mutex);
+}
+
+/// @brief Writes a formatted message to the linker log if it is available.
+/// @param linker_log Linker log file handle.
+/// @param format printf-style format string.
+static void write_linker_log(FILE *linker_log, const char *format, ...) {
+    if (linker_log == NULL) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(linker_log, format, args);
+    va_end(args);
+    fflush(linker_log);
+}
+
+/// @brief Finds the original manifest task that produced a worker result.
+/// @param source_path Source path reported by the worker.
+/// @param object_path Object path reported by the worker.
+/// @return Original task index, or -1 if the result does not match the manifest.
+static int find_original_task_index(const char *source_path, const char *object_path) {
+    if (source_path == NULL || object_path == NULL) {
+        return -1;
+    }
+
+    for (int i = 0; i < original_task_count; i++) {
+        if (strcmp(task_queue[i].source_path, source_path) == 0 &&
+            strcmp(task_queue[i].object_path, object_path) == 0) {
+            return i;
+        }
+    }
+
+    for (int i = 0; i < original_task_count; i++) {
+        if (strcmp(task_queue[i].object_path, object_path) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+/// @brief Records one task result and determines whether all objects are ready for linking.
+/// @param source_path Source path reported by the worker.
+/// @param object_path Object path reported by the worker.
+/// @param success 1 when the object was compiled and received successfully.
+/// @return 1 if the coordinator should start linking now, 0 otherwise.
+static int record_task_result_for_link(const char *source_path, const char *object_path, int success) {
+    int should_link = 0;
+    int task_index = find_original_task_index(source_path, object_path);
+
+    pthread_mutex_lock(&build_mutex);
+
+    if (task_index < 0) {
+        build_failed = 1;
+        log_event("[ERROR] Task result did not match manifest | source=%s | object=%s\n",
+            source_path != NULL ? source_path : "<unknown>",
+            object_path != NULL ? object_path : "<unknown>");
+        pthread_mutex_unlock(&build_mutex);
+        return 0;
+    }
+
+    if (success) {
+        if (!object_ready[task_index]) {
+            object_ready[task_index] = 1;
+            object_ready_count++;
+            log_event("OBJECT READY | source=%s | object=%s | completed=%d/%d\n",
+                task_queue[task_index].source_path, task_queue[task_index].object_path,
+                object_ready_count, original_task_count);
+        } else {
+            log_event("DUPLICATE OBJECT RESULT IGNORED | source=%s | object=%s\n",
+                source_path, object_path);
+        }
+    } else if (!object_ready[task_index]) {
+        build_failed = 1;
+        log_event("[ERROR] Build task failed; linking skipped | source=%s | object=%s\n",
+            task_queue[task_index].source_path, task_queue[task_index].object_path);
+    }
+
+    if (!build_failed && !link_started && object_ready_count == original_task_count) {
+        link_started = 1;
+        should_link = 1;
+    }
+
+    pthread_mutex_unlock(&build_mutex);
+    return should_link;
+}
+
+/// @brief Links all received manifest object files into the requested build output.
+/// @return 1 on successful link, 0 otherwise.
+static int run_link_step(void) {
+    const char *linker_driver = select_linker_driver();
+    FILE *linker_log = fopen(LINKER_LOG_PATH, "w");
+    if (linker_log == NULL) {
+        log_event("[ERROR] Failed to create linker log %s: %s\n", LINKER_LOG_PATH, strerror(errno));
+        printf("Failed to create linker log %s: %s\n", LINKER_LOG_PATH, strerror(errno));
+    } else {
+        log_event("LINKER LOG PRODUCED | path=%s\n", LINKER_LOG_PATH);
+    }
+
+    write_linker_log(linker_log, "Remocom linker log\n");
+    write_linker_log(linker_log, "output=%s\n", build_manifest.output);
+    write_linker_log(linker_log, "objects=%d\n", original_task_count);
+    write_linker_log(linker_log, "driver=%s\n", linker_driver);
+    write_linker_log(linker_log, "command=");
+    write_linker_log(linker_log, "%s", linker_driver);
+    for (int i = 0; i < original_task_count; i++) {
+        write_linker_log(linker_log, " %s", task_queue[i].object_path);
+    }
+    for (int i = 0; i < build_manifest.flag_count; i++) {
+        write_linker_log(linker_log, " %s", build_manifest.flags[i]);
+    }
+    write_linker_log(linker_log, " -o %s\n\n", build_manifest.output);
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        log_event("[ERROR] pipe() failed while linking output %s\n", build_manifest.output);
+        write_linker_log(linker_log, "error=pipe() failed: %s\n", strerror(errno));
+        if (linker_log != NULL) {
+            fclose(linker_log);
+        }
+        return 0;
+    }
+
+    log_event("LINK STARTED | output=%s | objects=%d\n", build_manifest.output, original_task_count);
+    write_linker_log(linker_log, "status=started\n");
+    printf("Linking %d object files into %s\n", original_task_count, build_manifest.output);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        log_event("[ERROR] fork() failed while linking output %s\n", build_manifest.output);
+        write_linker_log(linker_log, "error=fork() failed: %s\n", strerror(errno));
+        if (linker_log != NULL) {
+            fclose(linker_log);
+        }
+        return 0;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 || dup2(pipefd[1], STDERR_FILENO) < 0) {
+            close(pipefd[1]);
+            _exit(127);
+        }
+        close(pipefd[1]);
+
+        char *argv[MAX_TASKS + MAX_FLAGS + 4];
+        int argc = 0;
+        argv[argc++] = (char *)linker_driver;
+        for (int i = 0; i < original_task_count; i++) {
+            argv[argc++] = task_queue[i].object_path;
+        }
+        for (int i = 0; i < build_manifest.flag_count; i++) {
+            argv[argc++] = build_manifest.flags[i];
+        }
+        argv[argc++] = "-o";
+        argv[argc++] = build_manifest.output;
+        argv[argc] = NULL;
+
+        execvp(linker_driver, argv);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+
+    char output[LINK_OUTPUT_SIZE];
+    int read_ok = read_process_output(pipefd[0], output, sizeof(output));
+    close(pipefd[0]);
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0 || !read_ok) {
+        log_event("[ERROR] Link process failed while producing %s\n", build_manifest.output);
+        write_linker_log(linker_log, "status=failed\n");
+        write_linker_log(linker_log, "error=link process failed");
+        if (errno != 0) {
+            write_linker_log(linker_log, ": %s", strerror(errno));
+        }
+        write_linker_log(linker_log, "\n");
+        printf("Link failed for %s\n", build_manifest.output);
+        if (linker_log != NULL) {
+            fclose(linker_log);
+        }
+        return 0;
+    }
+
+    if (output[0] != '\0') {
+        log_event("\n\n--- linker output (%s) ---\n%s\n--- end linker output ---\n\n",
+            build_manifest.output, output);
+        write_linker_log(linker_log, "--- linker output ---\n%s\n--- end linker output ---\n", output);
+        printf("\n\n--- linker output (%s) ---\n%s--- end linker output ---\n\n",
+            build_manifest.output, output);
+    } else {
+        write_linker_log(linker_log, "--- linker output ---\n<empty>\n--- end linker output ---\n");
+    }
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        log_event("LINK SUCCEEDED | output=%s\n", build_manifest.output);
+        write_linker_log(linker_log, "status=succeeded\nexit_code=0\n");
+        printf("Link succeeded: %s\n", build_manifest.output);
+        if (linker_log != NULL) {
+            fclose(linker_log);
+        }
+        return 1;
+    }
+
+    if (WIFEXITED(status)) {
+        log_event("[ERROR] LINK FAILED | output=%s | exit_code=%d\n",
+            build_manifest.output, WEXITSTATUS(status));
+        write_linker_log(linker_log, "status=failed\nexit_code=%d\n", WEXITSTATUS(status));
+        printf("Link failed for %s with exit code %d\n",
+            build_manifest.output, WEXITSTATUS(status));
+    } else {
+        log_event("[ERROR] LINK FAILED | output=%s | abnormal termination\n", build_manifest.output);
+        write_linker_log(linker_log, "status=failed\ntermination=abnormal\n");
+        printf("Link failed for %s\n", build_manifest.output);
+    }
+
+    if (linker_log != NULL) {
+        fclose(linker_log);
+    }
+    return 0;
 }
 
 /// @brief Finds a worker by socket while workers_mutex is held.
@@ -573,10 +890,11 @@ static void assign_task_to_worker(int client_fd, int node_id) {
 /// @brief Logs compile task results reported by workers.
 /// @param node_id Worker node ID.
 /// @param payload Parsed task result payload.
-static void handle_task_result(int client_fd, int node_id, cJSON *payload) {
+/// @return 1 if all object files are ready and the caller should start linking.
+static int handle_task_result(int client_fd, int node_id, cJSON *payload) {
     if (!cJSON_IsObject(payload)) {
         log_event("TASK RESULT | Node %d | Invalid payload\n", node_id);
-        return;
+        return 0;
     }
 
     // Extract fields from payload with validation.
@@ -596,6 +914,8 @@ static void handle_task_result(int client_fd, int node_id, cJSON *payload) {
     int exit_code_val = cJSON_IsNumber(exit_code) ? exit_code->valueint : -1;
     const char *message_str = cJSON_IsString(message) ? message->valuestring : "<none>";
     int should_receive_object = cJSON_IsBool(has_object) && cJSON_IsTrue(has_object) && cJSON_IsString(object);
+    int compile_succeeded = strcmp(status_str, "success") == 0 && exit_code_val == 0;
+    int object_received = 0;
     uint64_t object_size_val = 0;
     int has_object_size = parse_u64_string(object_size, &object_size_val);
 
@@ -612,6 +932,7 @@ static void handle_task_result(int client_fd, int node_id, cJSON *payload) {
 
     if (should_receive_object && has_object_size) {
         if (remocom_recv_file_stream(client_fd, object_str, object_size_val)) {
+            object_received = 1;
             log_event("OBJECT RECEIVED | Node %d | object=%s | bytes=%" PRIu64 "\n",
                 node_id, object_str, object_size_val);
             printf("Object received from Node %d: %s (%" PRIu64 " bytes)\n",
@@ -626,6 +947,13 @@ static void handle_task_result(int client_fd, int node_id, cJSON *payload) {
         log_event("[ERROR] Worker reported object without valid object_size | Node %d | object=%s\n",
             node_id, object_str);
     }
+
+    if (compile_succeeded && !object_received) {
+        log_event("[ERROR] Successful task did not produce a received object | Node %d | source=%s | object=%s\n",
+            node_id, source_str, object_str);
+    }
+
+    return record_task_result_for_link(source_str, object_str, compile_succeeded && object_received);
 }
 
 /// @brief Handles a parsed worker message after JSON validation.
@@ -707,16 +1035,20 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
     } else if (strcmp(type->valuestring, MSG_TYPE_TASK_REQUEST) == 0) {
         assign_task_to_worker(client_fd, node_id); // Assign next task or report no-task.
     } else if (strcmp(type->valuestring, MSG_TYPE_TASK_RESULT) == 0) {
-        handle_task_result(client_fd, node_id, payload); // Log the task result reported by the worker.
+        int should_link = handle_task_result(client_fd, node_id, payload); // Log the task result reported by the worker.
 
-        // Worker finished this task - clear the active-task marker so it death
-        // from now on doesn't trigger a task reassignment
+        // Worker finished this task - clear the active-task marker so a later
+        // disconnect doesn't trigger a task reassignment.
         pthread_mutex_lock(&workers_mutex);
         Node *completed_worker = find_worker_by_socket_unlocked(client_fd);
         if(completed_worker != NULL){
             completed_worker->has_active_task = 0;
         }
         pthread_mutex_unlock(&workers_mutex);
+
+        if (should_link) {
+            run_link_step();
+        }
 
     } else {
         send_json_message(client_fd, "unknown", "Unknown message type");
