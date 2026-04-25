@@ -1,18 +1,22 @@
-#include <stdio.h>      // printf, perror
-#include <stdlib.h>     // exit
-#include <string.h>     // strlen
-#include <unistd.h>     // close
-#include <arpa/inet.h>  // socket structs and networking functions
-#include <pthread.h>    // thread library for handling multiple workers
-#include <cjson/cJSON.h> // Ultra lightweight JSON parser library
-#include <time.h>
-#include <stdarg.h>
-#include <errno.h>
-#include <inttypes.h>
-#include <limits.h>
-#include <sys/wait.h>
+#include <stdio.h>          // printf, perror
+#include <stdlib.h>         // exit
+#include <string.h>         // strlen
+#include <unistd.h>         // close
+#include <arpa/inet.h>      // socket structs and networking functions
+#include <pthread.h>        // thread library for handling multiple workers
+#include <cjson/cJSON.h>    // Ultra lightweight JSON parser library
+#include <stdarg.h>         // va_list and related functions for variable argument logging
+#include <errno.h>          // errno for error handling
+#include <inttypes.h>       // PRIu64 for portable uint64_t printing
+#include <limits.h>         // PATH_MAX for maximum path length
+
 #include "../common/common.h"
+#include "build_state.h"
+#include "coordinator_types.h"
+#include "linker.h"
 #include "manifest_loader.h"
+#include "task_dispatch.h"
+#include "worker_registry.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -20,161 +24,7 @@
 
 #define PORT 5000
 #define BUFFER_SIZE 4096
-#define MAX_WORKERS 100
-#define MAX_TASKS REMOCOM_MAX_SOURCES
-#define MAX_MANIFEST_VALUE REMOCOM_MAX_MANIFEST_VALUE
-#define MAX_FLAGS REMOCOM_MAX_FLAGS
-#define MAX_TRANSFER_FILES (REMOCOM_MAX_HEADERS + 1)
-#define DEPENDENCY_OUTPUT_SIZE 65536
-#define LINK_OUTPUT_SIZE 65536
-#define LINKER_LOG_PATH "linker.log"
 
-/// @brief Represents a compile task derived from the manifest, containing source/object paths, build output, and flags.
-typedef struct {
-    char source_path[MAX_MANIFEST_VALUE];
-    char object_path[MAX_MANIFEST_VALUE];
-    char build_output[MAX_MANIFEST_VALUE];
-    char flags[MAX_FLAGS][MAX_MANIFEST_VALUE];
-    int flag_count;
-} CompileTask;
-
-/// @brief Represents a file that needs to be transferred to a worker, including its path,
-/// kind (source or header), and size in bytes.
-typedef struct {
-    const char *path;
-    const char *kind;
-    uint64_t size;
-} TransferFile;
-
-/// @brief Adds a file to the list of files to be transferred.
-/// @param transfer_files Array of TransferFile structs being built for the current task assignment.
-/// @param transfer_paths Array of strings containing the paths of the files to be transferred.
-/// @param transfer_file_count Pointer to an integer representing the number of files in the transfer list.
-/// @param path The path of the file to be added.
-/// @param kind The kind of the file (source or header).
-/// @return 1 if successful, 0 otherwise.
-static int add_transfer_file(
-    TransferFile *transfer_files,
-    char transfer_paths[MAX_TRANSFER_FILES][MAX_MANIFEST_VALUE],
-    int *transfer_file_count,
-    const char *path,
-    const char *kind
-) {
-    for (int i = 0; i < *transfer_file_count; i++) {
-        if (strcmp(transfer_files[i].path, path) == 0) {
-            return 1;
-        }
-    }
-
-    if (*transfer_file_count >= MAX_TRANSFER_FILES) {
-        return 0;
-    }
-
-    snprintf(transfer_paths[*transfer_file_count], MAX_MANIFEST_VALUE, "%s", path);
-    transfer_files[*transfer_file_count].path = transfer_paths[*transfer_file_count];
-    transfer_files[*transfer_file_count].kind = kind;
-    transfer_files[*transfer_file_count].size = 0;
-    (*transfer_file_count)++;
-    return 1;
-}
-
-/// @brief Collects the source dependencies for a given compile task.
-/// @param task The compile task for which to collect dependencies.
-/// @param transfer_files Array of TransferFile structs being built for the current task assignment.
-/// @param transfer_paths Array of strings containing the paths of the files to be transferred.
-/// @param transfer_file_count Pointer to an integer representing the number of files
-/// in the transfer list.
-/// @param error_buf A buffer to store any error messages.
-/// @param error_buf_size The size of the error buffer.
-/// @return 1 if successful, 0 otherwise.
-static int collect_source_dependencies(
-    const CompileTask *task,
-    TransferFile *transfer_files,
-    char transfer_paths[MAX_TRANSFER_FILES][MAX_MANIFEST_VALUE],
-    int *transfer_file_count,
-    char *error_buf,
-    size_t error_buf_size
-) {
-    const char *compiler_driver = remocom_select_source_driver(task->source_path);
-    char *argv[MAX_FLAGS + 4];
-    int argc = 0;
-    argv[argc++] = (char *)compiler_driver;
-    for (int i = 0; i < task->flag_count; i++) {
-        argv[argc++] = (char *)task->flags[i];
-    }
-    argv[argc++] = "-MM";
-    argv[argc++] = (char *)task->source_path;
-    argv[argc] = NULL;
-
-    char output[DEPENDENCY_OUTPUT_SIZE] = {0};
-    int status = 0;
-    if (!remocom_run_process_capture(argv, output, sizeof(output), &status) ||
-        !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        snprintf(error_buf, error_buf_size, "Dependency scan failed for %s with %s: %s",
-            task->source_path, compiler_driver, output);
-        return 0;
-    }
-
-    char *deps = strchr(output, ':');
-    if (deps == NULL) {
-        snprintf(
-            error_buf,
-            error_buf_size,
-            "Dependency scan output missing ':' for %s",
-            task->source_path
-        );
-        return 0;
-    }
-
-    deps++;
-    for (char *cursor = deps; *cursor != '\0'; cursor++) {
-        if (*cursor == '\\' && (cursor[1] == '\n' || cursor[1] == '\r')) {
-            *cursor = ' ';
-        }
-        if (*cursor == '\n' || *cursor == '\r' || *cursor == '\t') {
-            *cursor = ' ';
-        }
-    }
-
-    char *token = strtok(deps, " ");
-    while (token != NULL) {
-        if (token[0] != '\0' && strcmp(token, "\\") != 0) {
-            const char *kind = strcmp(token, task->source_path) == 0 ? "source" : "header";
-            if (!add_transfer_file(transfer_files, transfer_paths, transfer_file_count, token, kind)) {
-                snprintf(
-                    error_buf,
-                    error_buf_size,
-                    "Too many dependency files for %s",
-                    task->source_path
-                );
-                return 0;
-            }
-        }
-        token = strtok(NULL, " ");
-    }
-
-    return 1;
-}
-
-/// @brief Represents the status of a worker node, which can be either dead or alive.
-typedef enum { dead, alive } NodeStatus;
-
-/// @brief Represents a worker node in the system, containing its ID, socket, IP address,
-/// last heartbeat timestamp, and status (alive or dead).
-typedef struct {
-    int nodeID;
-    int socketID;
-    char ip_address[INET_ADDRSTRLEN];
-    time_t last_heartbeat; // timestamp
-    NodeStatus status; // alive or dead
-    int handshake_completed;
-    int has_active_task; // 1 if worker is currently assigned a task
-    CompileTask current_task; // Copy of the task (valid only when has_active_task == 1)
-} Node;
-
-
-static Node workers[MAX_WORKERS];
-static int worker_count = 0;
 static FILE *log_file;
 
 static CompileTask task_queue[MAX_TASKS];
@@ -187,15 +37,23 @@ static int object_ready_count = 0;
 static int build_failed = 0;
 static int link_started = 0;
 
-static pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t build_mutex = PTHREAD_MUTEX_INITIALIZER;
+static BuildStateContext build_state;
+static TaskDispatchContext task_dispatch;
+static LinkerContext linker_context;
 
 static void send_json_message(int client_fd, const char *type_str, const char *payload_str);
 static void *handle_worker(void *arg);
-static void write_linker_log(FILE *linker_log, const char *format, ...);
+static void log_task_dispatch_message(void *callback_ctx, const char *message);
+static void requeue_worker_task(void *callback_ctx, const CompileTask *task);
 
+/// @brief Changes the current directory to the manifest's directory.
+/// @param manifest_path The path to the manifest file.
+/// @param error_buf The buffer to store any error messages.
+/// @param error_buf_size The size of the error buffer.
+/// @return 1 on success, 0 on failure.
 static int change_to_manifest_directory(const char *manifest_path, char *error_buf, size_t error_buf_size) {
     char manifest_copy[PATH_MAX];
     snprintf(manifest_copy, sizeof(manifest_copy), "%s", manifest_path);
@@ -239,25 +97,16 @@ static int derive_object_path(const char *source_path, char *object_path, size_t
     return needed > 0 && (size_t)needed < object_path_size;
 }
 
-/// @brief Selects the linker driver for the manifest's object files.
-/// @return "g++" when any original source is C++, otherwise "gcc".
-static const char *select_linker_driver(void) {
-    for (int i = 0; i < original_task_count; i++) {
-        if (strcmp(remocom_select_source_driver(task_queue[i].source_path), "g++") == 0) {
-            return "g++";
-        }
-    }
-
-    return "gcc";
-}
-
 /// @brief Loads a subset of TOML manifest format for the [build] section.
 /// @param manifest_path Path to manifest file.
 /// @param manifest Parsed output manifest.
 /// @param error_buf Destination buffer for validation errors.
 /// @param error_buf_size Size of error buffer.
 /// @return 1 on success, 0 on parse/validation failure.
-static int load_manifest_file(const char *manifest_path, BuildManifest *manifest, char *error_buf, size_t error_buf_size) {
+static int load_manifest_file(
+    const char *manifest_path, BuildManifest *manifest,
+    char *error_buf, size_t error_buf_size
+) {
     return remocom_load_manifest_file(manifest_path, manifest, error_buf, error_buf_size);
 }
 
@@ -266,7 +115,10 @@ static int load_manifest_file(const char *manifest_path, BuildManifest *manifest
 /// @param error_buf Destination buffer for validation errors.
 /// @param error_buf_size Size of error buffer.
 /// @return 1 on success, 0 when queue/object path validation fails.
-static int build_compile_tasks_from_manifest(const BuildManifest *manifest, char *error_buf, size_t error_buf_size) {
+static int build_compile_tasks_from_manifest(
+    const BuildManifest *manifest,
+    char *error_buf, size_t error_buf_size
+) {
     total_tasks = 0;
     original_task_count = 0;
     next_task_index = 0;
@@ -275,6 +127,9 @@ static int build_compile_tasks_from_manifest(const BuildManifest *manifest, char
     link_started = 0;
     memset(object_ready, 0, sizeof(object_ready));
 
+    // For each source in the manifest, create a compile task with derived object paths and
+    // manifest flags. Validate that we don't exceed the maximum task count and that object paths
+    // can be derived within buffer limits.
     for (int i = 0; i < manifest->source_count; i++) {
         if (total_tasks >= MAX_TASKS) {
             snprintf(error_buf, error_buf_size, "Manifest contains more than %d sources", MAX_TASKS);
@@ -336,12 +191,11 @@ static int parse_manifest_cli_flag(int argc, char **argv, const char **manifest_
 }
 
 /// @brief Validates and applies handshake payload for a worker.
-/// @param worker Worker record to update if handshake is accepted.
 /// @param payload Parsed payload object from incoming message.
 /// @param reason_buf Output buffer for mismatch reason.
 /// @param reason_buf_len Size of reason buffer.
 /// @return 1 if payload matches coordinator requirements, 0 otherwise.
-static int validate_handshake_payload(Node *worker, cJSON *payload, char *reason_buf, size_t reason_buf_len) {
+static int validate_handshake_payload(cJSON *payload, char *reason_buf, size_t reason_buf_len) {
     if (payload == NULL || !cJSON_IsObject(payload)) {
         snprintf(reason_buf, reason_buf_len, "Handshake payload must be an object");
         return 0;
@@ -385,7 +239,6 @@ static int validate_handshake_payload(Node *worker, cJSON *payload, char *reason
         return 0;
     }
 
-    worker->handshake_completed = 1;
     return 1;
 }
 
@@ -394,7 +247,6 @@ static int validate_handshake_payload(Node *worker, cJSON *payload, char *reason
 static void log_event(const char *format, ...) {
     pthread_mutex_lock(&log_mutex);
 
-    // Use vfprintf to handle the variable argument list for formatted logging.
     va_list args;
     va_start(args, format);
     vfprintf(log_file, format, args);
@@ -404,322 +256,63 @@ static void log_event(const char *format, ...) {
     pthread_mutex_unlock(&log_mutex);
 }
 
-/// @brief Writes a formatted message to the linker log if it is available.
-/// @param linker_log Linker log file handle.
-/// @param format printf-style format string.
-static void write_linker_log(FILE *linker_log, const char *format, ...) {
-    if (linker_log == NULL) {
-        return;
-    }
-
-    va_list args;
-    va_start(args, format);
-    vfprintf(linker_log, format, args);
-    va_end(args);
-    fflush(linker_log);
+/// @brief Logs messages from task dispatch and linker contexts to the coordinator log file.
+/// @param message The message to log.
+static void log_task_dispatch_message(void *callback_ctx, const char *message) {
+    (void)callback_ctx;
+    log_event("%s", message);
 }
 
-/// @brief Finds the original manifest task that produced a worker result.
-/// @param source_path Source path reported by the worker.
-/// @param object_path Object path reported by the worker.
-/// @return Original task index, or -1 if the result does not match the manifest.
-static int find_original_task_index(const char *source_path, const char *object_path) {
-    if (source_path == NULL || object_path == NULL) {
-        return -1;
-    }
-
-    for (int i = 0; i < original_task_count; i++) {
-        if (strcmp(task_queue[i].source_path, source_path) == 0 &&
-            strcmp(task_queue[i].object_path, object_path) == 0) {
-            return i;
-        }
-    }
-
-    for (int i = 0; i < original_task_count; i++) {
-        if (strcmp(task_queue[i].object_path, object_path) == 0) {
-            return i;
-        }
-    }
-
-    return -1;
+/// @brief Requeues a worker task for reassignment.
+/// @param task The task to requeue.
+static void requeue_worker_task(void *callback_ctx, const CompileTask *task) {
+    (void)callback_ctx;
+    remocom_enqueue_task_for_reassign(&task_dispatch, task);
 }
 
-/// @brief Records one task result and determines whether all objects are ready for linking.
-/// @param source_path Source path reported by the worker.
-/// @param object_path Object path reported by the worker.
-/// @param success 1 when the object was compiled and received successfully.
-/// @return 1 if the coordinator should start linking now, 0 otherwise.
-static int record_task_result_for_link(const char *source_path, const char *object_path, int success) {
-    int should_link = 0;
-    int task_index = find_original_task_index(source_path, object_path);
-
-    pthread_mutex_lock(&build_mutex);
-
-    if (task_index < 0) {
-        build_failed = 1;
-        log_event("[ERROR] Task result did not match manifest | source=%s | object=%s\n",
-            source_path != NULL ? source_path : "<unknown>",
-            object_path != NULL ? object_path : "<unknown>");
-        pthread_mutex_unlock(&build_mutex);
-        return 0;
-    }
-
-    if (success) {
-        if (!object_ready[task_index]) {
-            object_ready[task_index] = 1;
-            object_ready_count++;
-            log_event("OBJECT READY | source=%s | object=%s | completed=%d/%d\n",
-                task_queue[task_index].source_path, task_queue[task_index].object_path,
-                object_ready_count, original_task_count);
-        } else {
-            log_event("DUPLICATE OBJECT RESULT IGNORED | source=%s | object=%s\n",
-                source_path, object_path);
-        }
-    } else if (!object_ready[task_index]) {
-        build_failed = 1;
-        log_event("[ERROR] Build task failed; linking skipped | source=%s | object=%s\n",
-            task_queue[task_index].source_path, task_queue[task_index].object_path);
-    }
-
-    if (!build_failed && !link_started && object_ready_count == original_task_count) {
-        link_started = 1;
-        should_link = 1;
-    }
-
-    pthread_mutex_unlock(&build_mutex);
-    return should_link;
+/// @brief Configures the worker registry with logging and requeueing callbacks.
+static void configure_worker_registry(void) {
+    WorkerRegistryConfig config;
+    config.log_message = log_task_dispatch_message;
+    config.requeue_task = requeue_worker_task;
+    config.callback_ctx = NULL;
+    remocom_worker_registry_configure(&config);
 }
 
-/// @brief Links all received manifest object files into the requested build output.
-/// @return 1 on successful link, 0 otherwise.
-static int run_link_step(void) {
-    const char *linker_driver = select_linker_driver();
-    FILE *linker_log = fopen(LINKER_LOG_PATH, "w");
-    if (linker_log == NULL) {
-        log_event("[ERROR] Failed to create linker log %s: %s\n", LINKER_LOG_PATH, strerror(errno));
-        printf("Failed to create linker log %s: %s\n", LINKER_LOG_PATH, strerror(errno));
-    } else {
-        log_event("LINKER LOG PRODUCED | path=%s\n", LINKER_LOG_PATH);
-    }
-
-    write_linker_log(linker_log, "Remocom linker log\n");
-    write_linker_log(linker_log, "output=%s\n", build_manifest.output);
-    write_linker_log(linker_log, "objects=%d\n", original_task_count);
-    write_linker_log(linker_log, "driver=%s\n", linker_driver);
-    write_linker_log(linker_log, "command=");
-    write_linker_log(linker_log, "%s", linker_driver);
-    for (int i = 0; i < original_task_count; i++) {
-        write_linker_log(linker_log, " %s", task_queue[i].object_path);
-    }
-    for (int i = 0; i < build_manifest.flag_count; i++) {
-        write_linker_log(linker_log, " %s", build_manifest.flags[i]);
-    }
-    write_linker_log(linker_log, " -o %s\n\n", build_manifest.output);
-
-    log_event("LINK STARTED | output=%s | objects=%d\n", build_manifest.output, original_task_count);
-    write_linker_log(linker_log, "status=started\n");
-    printf("Linking %d object files into %s\n", original_task_count, build_manifest.output);
-
-    char *argv[MAX_TASKS + MAX_FLAGS + 4];
-    int argc = 0;
-    argv[argc++] = (char *)linker_driver;
-    for (int i = 0; i < original_task_count; i++) {
-        argv[argc++] = task_queue[i].object_path;
-    }
-    for (int i = 0; i < build_manifest.flag_count; i++) {
-        argv[argc++] = build_manifest.flags[i];
-    }
-    argv[argc++] = "-o";
-    argv[argc++] = build_manifest.output;
-    argv[argc] = NULL;
-
-    char output[LINK_OUTPUT_SIZE] = {0};
-    int status = 0;
-    if (!remocom_run_process_capture(argv, output, sizeof(output), &status)) {
-        log_event("[ERROR] Link process failed while producing %s\n", build_manifest.output);
-        write_linker_log(linker_log, "status=failed\n");
-        write_linker_log(linker_log, "error=link process failed");
-        if (errno != 0) {
-            write_linker_log(linker_log, ": %s", strerror(errno));
-        }
-        write_linker_log(linker_log, "\n");
-        printf("Link failed for %s\n", build_manifest.output);
-        if (linker_log != NULL) {
-            fclose(linker_log);
-        }
-        return 0;
-    }
-
-    if (output[0] != '\0') {
-        log_event("\n\n--- linker output (%s) ---\n%s\n--- end linker output ---\n\n",
-            build_manifest.output, output);
-        write_linker_log(linker_log, "--- linker output ---\n%s\n--- end linker output ---\n", output);
-        printf("\n\n--- linker output (%s) ---\n%s--- end linker output ---\n\n",
-            build_manifest.output, output);
-    } else {
-        write_linker_log(linker_log, "--- linker output ---\n<empty>\n--- end linker output ---\n");
-    }
-
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        log_event("LINK SUCCEEDED | output=%s\n", build_manifest.output);
-        write_linker_log(linker_log, "status=succeeded\nexit_code=0\n");
-        printf("Link succeeded: %s\n", build_manifest.output);
-        if (linker_log != NULL) {
-            fclose(linker_log);
-        }
-        return 1;
-    }
-
-    if (WIFEXITED(status)) {
-        log_event("[ERROR] LINK FAILED | output=%s | exit_code=%d\n",
-            build_manifest.output, WEXITSTATUS(status));
-        write_linker_log(linker_log, "status=failed\nexit_code=%d\n", WEXITSTATUS(status));
-        printf("Link failed for %s with exit code %d\n",
-            build_manifest.output, WEXITSTATUS(status));
-    } else {
-        log_event("[ERROR] LINK FAILED | output=%s | abnormal termination\n", build_manifest.output);
-        write_linker_log(linker_log, "status=failed\ntermination=abnormal\n");
-        printf("Link failed for %s\n", build_manifest.output);
-    }
-
-    if (linker_log != NULL) {
-        fclose(linker_log);
-    }
-    return 0;
+/// @brief Configures the linker context.
+static void configure_linker_context(void) {
+    linker_context.manifest = &build_manifest;
+    linker_context.tasks = task_queue;
+    linker_context.task_count = original_task_count;
+    linker_context.log_message = log_task_dispatch_message;
+    linker_context.callback_ctx = NULL;
 }
 
-/// @brief Finds a worker by socket while workers_mutex is held.
-/// @param client_fd Socket descriptor to locate.
-/// @return Pointer to worker entry or NULL if not found.
-static Node *find_worker_by_socket_unlocked(int client_fd) {
-    for (int i = 0; i < worker_count; i++) {
-        if (workers[i].socketID == client_fd) {
-            return &workers[i];
-        }
-    }
-    return NULL;
+/// @brief Configures the build state context with task information and logging callback.
+static void configure_build_state_context(void) {
+    build_state.tasks = task_queue;
+    build_state.task_count = original_task_count;
+    build_state.object_ready = object_ready;
+    build_state.object_ready_count = &object_ready_count;
+    build_state.build_failed = &build_failed;
+    build_state.link_started = &link_started;
+    build_state.build_mutex = &build_mutex;
+    build_state.log_message = log_task_dispatch_message;
+    build_state.callback_ctx = NULL;
 }
 
-/// @brief Appends a task to the end of the main queue for reassignment. Called must hold task_mutex
-/// @param task Tasks to re-enqueue
-static void enqueue_for_reassign_unlocked(const CompileTask *task){
-    if (total_tasks < MAX_TASKS){
-        task_queue[total_tasks] = *task;
-        total_tasks++;
-    } else {
-        log_event("[ERROR] Cannot re-enqueue task (queue full, MAX_TASKS = %d): source=%s - build will be incomplete\n",
-            MAX_TASKS, task->source_path);
-    }
-}
-
-static void requeue_task_for_prepare_failure(const CompileTask *task) {
-    pthread_mutex_lock(&task_mutex);
-    enqueue_for_reassign_unlocked(task);
-    pthread_mutex_unlock(&task_mutex);
-}
-
-/// @brief Assigns the next queued task to a worker or reports no-task.
-/// @param client_fd Worker socket.
-/// @param node_id Worker node ID for logging.
-static void assign_task_to_worker(int client_fd, int node_id) {
-    // Lock task queue so only one worker gets each task.
-    pthread_mutex_lock(&task_mutex);
-
-    // Check if there are tasks left to assign.
-    if (next_task_index < total_tasks) {
-        CompileTask task = task_queue[next_task_index];
-        next_task_index++;
-        pthread_mutex_unlock(&task_mutex);
-
-        TransferFile transfer_files[MAX_TRANSFER_FILES];
-        char transfer_paths[MAX_TRANSFER_FILES][MAX_MANIFEST_VALUE];
-        int transfer_file_count = 0;
-        char dependency_error[1024];
-
-        if (!add_transfer_file(transfer_files, transfer_paths, &transfer_file_count, task.source_path, "source")) {
-            log_event("[ERROR] Unable to queue source transfer | Node %d | Source: %s\n",
-                node_id, task.source_path);
-            requeue_task_for_prepare_failure(&task);
-            send_json_message(client_fd, "task_error", "Unable to queue source transfer");
-            return;
-        }
-
-        if (!collect_source_dependencies(&task, transfer_files, transfer_paths, &transfer_file_count,
-            dependency_error, sizeof(dependency_error))) {
-            log_event("[ERROR] %s\n", dependency_error);
-            requeue_task_for_prepare_failure(&task);
-            send_json_message(client_fd, "task_error", dependency_error);
-            return;
-        }
-
-        for (int i = 0; i < build_manifest.header_count; i++) {
-            if (!add_transfer_file(transfer_files, transfer_paths, &transfer_file_count,
-                build_manifest.headers[i], "header")) {
-                log_event("[ERROR] Too many transfer files for task | Node %d | Source: %s\n",
-                    node_id, task.source_path);
-                requeue_task_for_prepare_failure(&task);
-                send_json_message(client_fd, "task_error", "Too many transfer files");
-                return;
-            }
-        }
-
-        for (int i = 0; i < transfer_file_count; i++) {
-            if (!remocom_get_file_size(transfer_files[i].path, &transfer_files[i].size)) {
-                log_event("[ERROR] Transfer file unavailable for task | Node %d | File: %s\n",
-                    node_id, transfer_files[i].path);
-                requeue_task_for_prepare_failure(&task);
-                send_json_message(client_fd, "task_error", "Transfer file unavailable");
-                return;
-            }
-        }
-
-        // Record ownership so we can re-enqueue if this worker dies
-        pthread_mutex_lock(&workers_mutex);
-        Node *worker = find_worker_by_socket_unlocked(client_fd);
-        if(worker != NULL){
-            worker->current_task = task;
-            worker->has_active_task = 1;
-        }
-        pthread_mutex_unlock(&workers_mutex);
-
-        cJSON *payload = cJSON_CreateObject();
-        cJSON_AddStringToObject(payload, "source", task.source_path);
-        cJSON_AddStringToObject(payload, "object", task.object_path);
-        cJSON_AddStringToObject(payload, "output", task.build_output);
-
-        cJSON *files = cJSON_AddArrayToObject(payload, "files");
-        for (int i = 0; i < transfer_file_count; i++) {
-            char size_text[32];
-            snprintf(size_text, sizeof(size_text), "%" PRIu64, transfer_files[i].size);
-
-            cJSON *file_payload = cJSON_CreateObject();
-            cJSON_AddStringToObject(file_payload, "path", transfer_files[i].path);
-            cJSON_AddStringToObject(file_payload, "kind", transfer_files[i].kind);
-            cJSON_AddStringToObject(file_payload, "size", size_text);
-            cJSON_AddItemToArray(files, file_payload);
-        }
-
-        cJSON *flags = cJSON_AddArrayToObject(payload, "flags");
-        for (int i = 0; i < task.flag_count; i++) {
-            cJSON_AddItemToArray(flags, cJSON_CreateString(task.flags[i]));
-        }
-
-        int sent_ok = remocom_send_json_with_payload(client_fd, MSG_TYPE_TASK_ASSIGNMENT, payload);
-        for (int i = 0; sent_ok && i < transfer_file_count; i++) {
-            sent_ok = remocom_send_file_stream(client_fd, transfer_files[i].path);
-        }
-
-        if (!sent_ok) {
-            log_event("[ERROR] Failed sending source file to Node %d | Source: %s\n",
-                node_id, task.source_path);
-        }
-        log_event("TASK ASSIGNED | Node %d | Source: %s | Object: %s\n",
-            node_id, task.source_path, task.object_path);
-        return;
-    }
-
-    pthread_mutex_unlock(&task_mutex);
-    send_json_message(client_fd, MSG_TYPE_NO_TASK, "No tasks available");
+/// @brief Configures the task dispatch context with task queue information and callbacks for
+/// logging and marking tasks active.
+static void configure_task_dispatch_context(void) {
+    task_dispatch.task_queue = task_queue;
+    task_dispatch.max_tasks = MAX_TASKS;
+    task_dispatch.total_tasks = &total_tasks;
+    task_dispatch.next_task_index = &next_task_index;
+    task_dispatch.manifest = &build_manifest;
+    task_dispatch.task_mutex = &task_mutex;
+    task_dispatch.log_message = log_task_dispatch_message;
+    task_dispatch.mark_task_active = remocom_worker_registry_mark_task_active;
+    task_dispatch.callback_ctx = NULL;
 }
 
 /// @brief Logs compile task results reported by workers.
@@ -788,7 +381,12 @@ static int handle_task_result(int client_fd, int node_id, cJSON *payload) {
             node_id, source_str, object_str);
     }
 
-    return record_task_result_for_link(source_str, object_str, compile_succeeded && object_received);
+    return remocom_record_task_result_for_link(
+        &build_state,
+        source_str,
+        object_str,
+        compile_succeeded && object_received
+    );
 }
 
 /// @brief Handles a parsed worker message after JSON validation.
@@ -797,27 +395,19 @@ static int handle_task_result(int client_fd, int node_id, cJSON *payload) {
 /// @param payload Parsed message payload field.
 /// @param is_dead Set to 1 when worker should be disconnected.
 static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, int *is_dead) {
-    // Look up this worker under lock so heartbeat/status updates are safe.
-    pthread_mutex_lock(&workers_mutex);
-    Node *worker = find_worker_by_socket_unlocked(client_fd);
-
-    if (worker == NULL) {
-        pthread_mutex_unlock(&workers_mutex);
+    WorkerSnapshot worker;
+    if (!remocom_worker_registry_get_snapshot(client_fd, &worker)) {
         return;
     }
 
-    int node_id = worker->nodeID;
-    NodeStatus status = worker->status;
-    int handshake_completed = worker->handshake_completed;
+    int node_id = worker.node_id;
 
     char *payload_str = cJSON_PrintUnformatted(payload);
     if (payload_str == NULL) {
         payload_str = strdup("<unprintable>");
     }
 
-    if (status == dead) {
-        pthread_mutex_unlock(&workers_mutex);
-
+    if (worker.status == WORKER_STATUS_DEAD) {
         printf("Received Type: %s | Payload: %s (node already timed out)\n", type->valuestring, payload_str);
         log_event("MESSAGE RECEIVED by Node %d | Type: %s | Payload: %s (node already timed out)\n",
             node_id, type->valuestring, payload_str);
@@ -834,10 +424,10 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
 
     if (strcmp(type->valuestring, MSG_TYPE_HANDSHAKE) == 0) {
         char mismatch_reason[256];
-        int handshake_ok = validate_handshake_payload(worker, payload, mismatch_reason, sizeof(mismatch_reason));
-        pthread_mutex_unlock(&workers_mutex);
+        int handshake_ok = validate_handshake_payload(payload, mismatch_reason, sizeof(mismatch_reason));
 
         if (handshake_ok) {
+            remocom_worker_registry_mark_handshake_completed(client_fd);
             send_json_message(client_fd, MSG_TYPE_HANDSHAKE_ACK, "Handshake accepted");
             log_event("HANDSHAKE ACCEPTED Node %d\n", node_id);
             return;
@@ -849,124 +439,36 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
         return;
     }
 
-    if (!handshake_completed) {
-        pthread_mutex_unlock(&workers_mutex);
+    if (!worker.handshake_completed) {
         send_json_message(client_fd, MSG_TYPE_HANDSHAKE_REQUIRED, "Handshake required before registration");
         return;
     }
 
     // Handle heartbeat immediately to keep worker alive in the system.
     if (strcmp(type->valuestring, "heartbeat") == 0) {
-        worker->last_heartbeat = time(NULL);
-        pthread_mutex_unlock(&workers_mutex);
+        remocom_worker_registry_update_heartbeat(client_fd);
         return;
     }
-
-    pthread_mutex_unlock(&workers_mutex);
 
     // Handle other message types outside the lock.
     if (strcmp(type->valuestring, "register") == 0) {
         send_json_message(client_fd, "ack", "Worker registered"); // Acknowledge registration.
     } else if (strcmp(type->valuestring, MSG_TYPE_TASK_REQUEST) == 0) {
-        assign_task_to_worker(client_fd, node_id); // Assign next task or report no-task.
+        remocom_assign_task_to_worker(&task_dispatch, client_fd, node_id);
     } else if (strcmp(type->valuestring, MSG_TYPE_TASK_RESULT) == 0) {
         int should_link = handle_task_result(client_fd, node_id, payload); // Log the task result reported by the worker.
 
         // Worker finished this task - clear the active-task marker so a later
         // disconnect doesn't trigger a task reassignment.
-        pthread_mutex_lock(&workers_mutex);
-        Node *completed_worker = find_worker_by_socket_unlocked(client_fd);
-        if(completed_worker != NULL){
-            completed_worker->has_active_task = 0;
-        }
-        pthread_mutex_unlock(&workers_mutex);
+        remocom_worker_registry_clear_active_task(client_fd);
 
         if (should_link) {
-            run_link_step();
+            remocom_run_link_step(&linker_context);
         }
 
     } else {
         send_json_message(client_fd, "unknown", "Unknown message type");
     }
-}
-
-/// @brief Removes a worker from the global list and logs disconnect reason.
-/// @param client_fd Worker socket to remove.
-static void remove_worker_by_socket(int client_fd) {
-    pthread_mutex_lock(&workers_mutex);
-
-    // Locate the worker.
-    for (int i = 0; i < worker_count; i++) {
-        Node *worker = &workers[i];
-
-        // Log the disconnect event with reason (timeout vs normal disconnect) and remove the worker by replacing it with the last entry in the list.
-        if (worker->socketID == client_fd) {
-            if (worker->status == dead) {
-                log_event("REMOVED (timeout) Node %d | IP: %s\n", worker->nodeID, worker->ip_address);
-                // Monitor already re-queued the task (if any) when it set status = dead.
-            } else {
-                log_event("DISCONNECT Node %d | IP: %s | Socket: %d\n",
-                    worker->nodeID, worker->ip_address, worker->socketID);
-                
-                // Worker disconnected before monitor saw it - re-queue its task here
-                if(worker->has_active_task){
-                    log_event("RE-ENQUEUE task for reassignment | Node %d | Source: %s\n",
-                    worker->nodeID, worker->current_task.source_path);
-
-                    pthread_mutex_lock(&task_mutex);
-                    enqueue_for_reassign_unlocked(&worker->current_task);
-                    pthread_mutex_unlock(&task_mutex);
-
-                    worker->has_active_task = 0;
-                }
-            }
-
-            *worker = workers[worker_count - 1];
-            worker_count--;
-            break;
-        }
-    }
-
-    printf("Worker removed. Total workers: %d\n", worker_count);
-    pthread_mutex_unlock(&workers_mutex);
-}
-
-/// @brief Registers a newly connected worker or rejects it if capacity is full.
-/// @param client_fd Worker socket.
-/// @param client_addr Remote address for logging.
-/// @return 1 if worker is registered, 0 if rejected.
-static int register_worker(int client_fd, const struct sockaddr_in *client_addr) {
-    // Register this socket as a worker unless we are at max capacity.
-    pthread_mutex_lock(&workers_mutex);
-
-    // Check if we have room for another worker. If not, reject the connection and log the event.
-    if (worker_count >= MAX_WORKERS) {
-        pthread_mutex_unlock(&workers_mutex);
-        log_event("[WARNING] Rejecting connection: max worker limit reached\n");
-        close(client_fd);
-        return 0;
-    }
-
-    // Create new worker.
-    Node *worker = &workers[worker_count];
-    worker->socketID = client_fd;
-    worker->nodeID = worker_count;
-    worker->last_heartbeat = time(NULL);
-    worker->status = alive;
-    worker->handshake_completed = 0;
-    worker->has_active_task = 0;
-    // current_task left uninitialized - unsed until has_active_task becomes 1
-
-    // Convert the client's IP address to a string and store it in the worker struct.
-    inet_ntop(AF_INET, &client_addr->sin_addr, worker->ip_address, INET_ADDRSTRLEN);
-
-    printf("Worker added. Total workers: %d\n", worker_count + 1);
-    log_event("CONNECT Node %d | IP: %s | Socket: %d\n",
-        worker->nodeID, worker->ip_address, worker->socketID);
-
-    worker_count++;
-    pthread_mutex_unlock(&workers_mutex);
-    return 1;
 }
 
 /// @brief Creates and detaches a handler thread for a worker connection.
@@ -979,16 +481,7 @@ static int spawn_worker_thread(int *client_fd_ptr) {
     // If thread creation fails, clean up by removing the worker from the list, closing the socket, and logging the error.
     if (pthread_create(&thread_id, NULL, handle_worker, client_fd_ptr) != 0) {
         perror("Thread creation failed");
-
-        pthread_mutex_lock(&workers_mutex);
-        Node *worker = find_worker_by_socket_unlocked(*client_fd_ptr);
-        if (worker != NULL) {
-            log_event("[ERROR] Failed to connect Node %d to thread.\n", worker->nodeID);
-            *worker = workers[worker_count - 1];
-            worker_count--;
-        }
-        pthread_mutex_unlock(&workers_mutex);
-
+        remocom_worker_registry_remove_for_thread_failure(*client_fd_ptr);
         close(*client_fd_ptr);
         free(client_fd_ptr);
         return 0;
@@ -1031,46 +524,6 @@ static int create_server_socket(void) {
     }
 
     return server_fd;
-}
-
-/// @brief Checks in with live worker nodes every 10 seconds, marking them as dead if they haven't sent a heartbeat within the last 15 seconds and logging timeouts.
-static void *monitor_workers(void *arg) {
-    (void)arg;
-
-    while (1) {
-        sleep(10);
-        time_t current_time = time(NULL);
-
-        pthread_mutex_lock(&workers_mutex); // Lock worker list.
-        // Loop through all live workers and check for timeouts.
-        for (int i = 0; i < worker_count; i++) {
-            Node *worker = &workers[i];
-            int time_since_heartbeat = (int)(current_time - worker->last_heartbeat);
-
-            if (time_since_heartbeat > 15 && worker->status != dead) {
-                // Log the timeout event.
-                log_event("[TIMEOUT] Node %d | IP: %s\n", worker->nodeID, worker->ip_address);
-                // Mark the worker as dead and close its socket.
-                worker->status = dead;
-                close(worker->socketID);
-
-                // If this worker was mid-task, push the task back for reassignment
-                if(worker->has_active_task){
-                    log_event("RE-ENQUEUE task for reassignment | Node %d | Source: %s\n",
-                    worker->nodeID, worker->current_task.source_path);
-
-                    pthread_mutex_lock(&task_mutex);
-                    enqueue_for_reassign_unlocked(&worker->current_task);
-                    pthread_mutex_unlock(&task_mutex);
-
-                    worker->has_active_task = 0;
-                }
-            }
-        }
-        pthread_mutex_unlock(&workers_mutex); // Unlock worker list.
-    }
-
-    return NULL;
 }
 
 /// @brief Sends a JSON message to a connected worker.
@@ -1129,7 +582,7 @@ static void *handle_worker(void *arg) {
         printf("Worker disconnected\n");
     }
 
-    remove_worker_by_socket(client_fd);
+    remocom_worker_registry_remove_by_socket(client_fd);
     close(client_fd);
     printf("Helper finished worker\n");
     return NULL;
@@ -1159,6 +612,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%s\n", manifest_error);
         return 1;
     }
+    configure_task_dispatch_context();
+    configure_linker_context();
+    configure_build_state_context();
+    configure_worker_registry();
 
     int server_fd;
     struct sockaddr_in client_addr;
@@ -1178,7 +635,7 @@ int main(int argc, char **argv) {
 
     // Create thread that will monitor heartbeat status of nodes.
     pthread_t monitor_thread;
-    pthread_create(&monitor_thread, NULL, monitor_workers, NULL);
+    pthread_create(&monitor_thread, NULL, remocom_worker_registry_monitor, NULL);
     pthread_detach(monitor_thread);
 
     printf("Coordinator listening on port %d\n", PORT);
@@ -1201,7 +658,7 @@ int main(int argc, char **argv) {
         }
 
         // Register this worker in the system and log the connection. If registration fails, clean up.
-        if (!register_worker(*client_fd_ptr, &client_addr)) {
+        if (!remocom_worker_registry_register(*client_fd_ptr, &client_addr)) {
             free(client_fd_ptr);
             continue;
         }

@@ -8,6 +8,8 @@
 #define REMOCOM_MAX_SOURCES 256
 #define REMOCOM_MAX_HEADERS 256
 
+/// @brief Represents the contents of a build manifest, including the output path,
+/// compiler flags, source files, and header files.
 typedef struct {
     char output[REMOCOM_MAX_MANIFEST_VALUE];
     char flags[REMOCOM_MAX_FLAGS][REMOCOM_MAX_MANIFEST_VALUE];
