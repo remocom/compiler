@@ -24,6 +24,10 @@
 
 const char *remocom_detect_target_arch(void);
 const char *remocom_detect_target_os(void);
+int remocom_parse_u64_string(cJSON *value, uint64_t *out);
+int remocom_is_cpp_source_path(const char *source_path);
+const char *remocom_select_source_driver(const char *source_path);
+int remocom_read_process_output(int read_fd, char *output, size_t output_size);
 
 int remocom_send_all(int fd, const void *buf, size_t len);
 int remocom_recv_all(int fd, void *buf, size_t len);

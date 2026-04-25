@@ -86,6 +86,95 @@ const char *remocom_detect_target_os(void) {
 #endif
 }
 
+/// @brief Parses a JSON string into a uint64_t value.
+/// @param value The JSON string to parse.
+/// @param out Destination for the parsed value.
+/// @return 1 if successful, 0 otherwise.
+int remocom_parse_u64_string(cJSON *value, uint64_t *out) {
+    if (!cJSON_IsString(value) || out == NULL) {
+        return 0;
+    }
+
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(value->valuestring, &end, 10);
+    if (errno != 0 || end == value->valuestring || *end != '\0') {
+        return 0;
+    }
+
+    *out = (uint64_t)parsed;
+    return 1;
+}
+
+/// @brief Checks whether a source path should use the C++ compiler driver.
+/// @param source_path Source path from the manifest or task payload.
+/// @return 1 for common C++ source extensions, 0 otherwise.
+int remocom_is_cpp_source_path(const char *source_path) {
+    if (source_path == NULL) {
+        return 0;
+    }
+
+    const char *extension = strrchr(source_path, '.');
+    if (extension == NULL) {
+        return 0;
+    }
+
+    return strcmp(extension, ".cpp") == 0 ||
+        strcmp(extension, ".cc") == 0 ||
+        strcmp(extension, ".cxx") == 0 ||
+        strcmp(extension, ".C") == 0;
+}
+
+/// @brief Selects the compiler driver for a source file.
+/// @return "g++" for C++ sources, otherwise "gcc".
+const char *remocom_select_source_driver(const char *source_path) {
+    return remocom_is_cpp_source_path(source_path) ? "g++" : "gcc";
+}
+
+/// @brief Captures child-process output and drains any bytes beyond the destination size.
+/// @param read_fd The file descriptor from which to read child stdout/stderr.
+/// @param output A buffer to store the captured output prefix.
+/// @param output_size The size of the output buffer.
+/// @return 1 if the stream was read successfully, 0 otherwise.
+int remocom_read_process_output(int read_fd, char *output, size_t output_size) {
+    size_t total = 0;
+    int ok = 1;
+
+    while (1) {
+        char discard[512];
+        char *target = discard;
+        size_t capacity = sizeof(discard);
+        int storing_output = 0;
+
+        if (output != NULL && output_size > 0 && total + 1 < output_size) {
+            target = output + total;
+            capacity = output_size - total - 1;
+            storing_output = 1;
+        }
+
+        ssize_t n = read(read_fd, target, capacity);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ok = 0;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+
+        if (storing_output) {
+            total += (size_t)n;
+        }
+    }
+
+    if (output != NULL && output_size > 0) {
+        output[total] = '\0';
+    }
+    return ok;
+}
+
 /// @brief Sends all data from a buffer to a file descriptor.
 /// @param fd The file descriptor to which to send data.
 /// @param buf The buffer containing the data to send.

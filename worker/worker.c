@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <dirent.h>
-#include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -78,26 +77,6 @@ static void send_handshake_message(int sock_fd) {
     remocom_send_json_with_payload(sock_fd, MSG_TYPE_HANDSHAKE, payload);
 }
 
-/// @brief Parses a JSON string into a uint64_t value.
-/// @param value The JSON string to parse.
-/// @param out A pointer to the uint64_t variable where the parsed value will be stored.
-/// @return 1 if successful, 0 otherwise.
-static int parse_u64_string(cJSON *value, uint64_t *out) {
-    if (!cJSON_IsString(value)) {
-        return 0;
-    }
-
-    char *end = NULL;
-    errno = 0;
-    unsigned long long parsed = strtoull(value->valuestring, &end, 10);
-    if (errno != 0 || end == value->valuestring || *end != '\0') {
-        return 0;
-    }
-
-    *out = (uint64_t)parsed;
-    return 1;
-}
-
 /// @brief Returns the relative path of a transfer file, removing leading slashes.
 /// @param path The absolute path of the transfer file.
 /// @return The relative path of the transfer file.
@@ -107,27 +86,6 @@ static const char *relative_transfer_path(const char *path) {
     }
 
     return path;
-}
-
-/// @brief Checks whether a source path should use the C++ compiler driver.
-/// @param source_path Source path from the task payload.
-/// @return 1 for common C++ source extensions, 0 otherwise.
-static int is_cpp_source_path(const char *source_path) {
-    const char *extension = strrchr(source_path, '.');
-    if (extension == NULL) {
-        return 0;
-    }
-
-    return strcmp(extension, ".cpp") == 0 ||
-        strcmp(extension, ".cc") == 0 ||
-        strcmp(extension, ".cxx") == 0 ||
-        strcmp(extension, ".C") == 0;
-}
-
-/// @brief Selects the compiler driver for a source file.
-/// @return "g++" for C++ sources, otherwise "gcc".
-static const char *select_source_driver(const char *source_path) {
-    return is_cpp_source_path(source_path) ? "g++" : "gcc";
 }
 
 /// @brief Constructs the full path for an include file within the task directory.
@@ -196,7 +154,7 @@ static void discard_task_files(int sock_fd, cJSON *files) {
         cJSON *file_item = cJSON_GetArrayItem(files, i);
         cJSON *size_json = cJSON_GetObjectItem(file_item, "size");
         uint64_t file_size = 0;
-        if (parse_u64_string(size_json, &file_size)) {
+        if (remocom_parse_u64_string(size_json, &file_size)) {
             discard_stream(sock_fd, file_size);
         }
     }
@@ -228,7 +186,7 @@ static int receive_task_files(int sock_fd, cJSON *files, const char *task_dir, c
         uint64_t file_size = 0;
 
         if (!cJSON_IsObject(file_item) || !cJSON_IsString(path_json) ||
-            !parse_u64_string(size_json, &file_size)) {
+            !remocom_parse_u64_string(size_json, &file_size)) {
             snprintf(status_message, status_message_size, "Invalid file metadata in task payload");
             return 0;
         }
@@ -303,46 +261,6 @@ static void register_with_coordinator(int sock_fd, char *buffer) {
     }
 }
 
-/// @brief Allows parent to read from port that Child wrote to.
-/// @param read_fd Read-end of the pipe
-/// @param compiler_output Buffer that stores info from the pipe.
-/// @param compiler_output_size size of compiler_output buffer
-static void read_from_pipe(int read_fd, char *compiler_output, size_t compiler_output_size){
-    size_t total= 0;
-    ssize_t n = 0;
-    int truncated = 0;
-    char discard_buf[512]; // used to help drain the buffer in the event compiler_output gets filled to the max and additional bytes still remain in pipe.
-
-    while(1){
-        if(!truncated && compiler_output_size > 1){
-            size_t space_left = (compiler_output_size - 1) - total;
-            if (space_left == 0){
-                truncated = 1;
-                continue;
-            }
-            n = read(read_fd, compiler_output + total, space_left);
-            if(n > 0){
-                total += (size_t)n;
-                if(total >= compiler_output_size -1){
-                    truncated = 1; // stop storing but keep draining pipe
-                }
-                continue;
-            }
-        } else{
-            n = read(read_fd, discard_buf, sizeof(discard_buf));
-            if(n > 0){
-                truncated = 1;
-                continue;
-            }
-        }
-        break;
-    }
-
-    if(compiler_output_size > 0){
-        compiler_output[total] = '\0';
-    }
-}
-
 /// @brief Executes a compile task received from the coordinator by invoking the appropriate compiler driver.
 /// @param payload Parsed task payload containing source/object/flags.
 /// @param source Output buffer for source path.
@@ -383,7 +301,7 @@ static int run_compile_task(
 
     snprintf(source, source_size, "%s", source_json->valuestring);
     snprintf(object, object_size, "%s", object_json->valuestring);
-    const char *compiler_driver = select_source_driver(source_json->valuestring);
+    const char *compiler_driver = remocom_select_source_driver(source_json->valuestring);
 
     char *argv[MAX_COMPILER_ARGS];
     char task_include_paths[MAX_TASK_FLAGS][512];
@@ -475,7 +393,7 @@ static int run_compile_task(
 
     close(pipefd[1]); // Parent does not write
 
-    read_from_pipe(pipefd[0], compiler_output, compiler_output_size);
+    remocom_read_process_output(pipefd[0], compiler_output, compiler_output_size);
     close(pipefd[0]);
 
     // In the parent process, wait for the child to finish and capture its exit status.
