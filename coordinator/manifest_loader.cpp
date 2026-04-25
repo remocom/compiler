@@ -33,12 +33,6 @@ static int copy_string_to_buffer(
     return 1;
 }
 
-/// @brief Loads a build manifest from a TOML file.
-/// @param manifest_path The path to the manifest file.
-/// @param manifest The manifest struct to populate.
-/// @param error_buf The buffer to store any error messages.
-/// @param error_buf_size The size of the error buffer.
-/// @return 1 on success, 0 otherwise.
 extern "C" int remocom_load_manifest_file(
     const char *manifest_path,
     BuildManifest *manifest,

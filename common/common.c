@@ -57,8 +57,6 @@ static int remocom_discard_stream(int fd, uint64_t size) {
     return 1;
 }
 
-/// @brief Detects the target architecture at compile time and returns it as a string.
-/// @return A pointer to the string representing the target architecture.
 const char *remocom_detect_target_arch(void) {
 #if defined(__x86_64__) || defined(_M_X64)
     return "x86_64";
@@ -73,8 +71,6 @@ const char *remocom_detect_target_arch(void) {
 #endif
 }
 
-/// @brief Detects the target operating system at compile time and returns it as a string.
-/// @return A pointer to the string representing the target operating system.
 const char *remocom_detect_target_os(void) {
 #if defined(__linux__)
     return "linux";
@@ -87,10 +83,6 @@ const char *remocom_detect_target_os(void) {
 #endif
 }
 
-/// @brief Parses a JSON string into a uint64_t value.
-/// @param value The JSON string to parse.
-/// @param out Destination for the parsed value.
-/// @return 1 if successful, 0 otherwise.
 int remocom_parse_u64_string(cJSON *value, uint64_t *out) {
     if (!cJSON_IsString(value) || out == NULL) {
         return 0;
@@ -107,9 +99,6 @@ int remocom_parse_u64_string(cJSON *value, uint64_t *out) {
     return 1;
 }
 
-/// @brief Checks whether a source path should use the C++ compiler driver.
-/// @param source_path Source path from the manifest or task payload.
-/// @return 1 for common C++ source extensions, 0 otherwise.
 int remocom_is_cpp_source_path(const char *source_path) {
     if (source_path == NULL) {
         return 0;
@@ -126,17 +115,10 @@ int remocom_is_cpp_source_path(const char *source_path) {
         strcmp(extension, ".C") == 0;
 }
 
-/// @brief Selects the compiler driver for a source file.
-/// @return "g++" for C++ sources, otherwise "gcc".
 const char *remocom_select_source_driver(const char *source_path) {
     return remocom_is_cpp_source_path(source_path) ? "g++" : "gcc";
 }
 
-/// @brief Captures child-process output and drains any bytes beyond the destination size.
-/// @param read_fd The file descriptor from which to read child stdout/stderr.
-/// @param output A buffer to store the captured output prefix.
-/// @param output_size The size of the output buffer.
-/// @return 1 if the stream was read successfully, 0 otherwise.
 int remocom_read_process_output(int read_fd, char *output, size_t output_size) {
     size_t total = 0;
     int ok = 1;
@@ -176,12 +158,6 @@ int remocom_read_process_output(int read_fd, char *output, size_t output_size) {
     return ok;
 }
 
-/// @brief Runs a child process, capturing stdout/stderr into a bounded buffer.
-/// @param argv Null-terminated argument vector. argv[0] is used as the executable.
-/// @param output Buffer for captured stdout/stderr.
-/// @param output_size Size of output buffer.
-/// @param wait_status_out Destination for the raw waitpid status.
-/// @return 1 if the child was launched, captured, and waited for successfully; 0 otherwise.
 int remocom_run_process_capture(
     char *const argv[],
     char *output,
@@ -245,11 +221,6 @@ int remocom_run_process_capture(
     return 1;
 }
 
-/// @brief Sends all data from a buffer to a file descriptor.
-/// @param fd The file descriptor to which to send data.
-/// @param buf The buffer containing the data to send.
-/// @param len The number of bytes to send.
-/// @return 1 if successful, 0 otherwise.
 int remocom_send_all(int fd, const void *buf, size_t len) {
     const unsigned char *cursor = (const unsigned char *)buf;
     size_t sent = 0;
@@ -271,11 +242,6 @@ int remocom_send_all(int fd, const void *buf, size_t len) {
     return 1;
 }
 
-/// @brief Receives all data from a file descriptor into a buffer.
-/// @param fd The file descriptor from which to receive data.
-/// @param buf The buffer into which to receive data.
-/// @param len The number of bytes to receive.
-/// @return 1 if successful, 0 otherwise.
 int remocom_recv_all(int fd, void *buf, size_t len) {
     unsigned char *cursor = (unsigned char *)buf;
     size_t received = 0;
@@ -297,11 +263,6 @@ int remocom_recv_all(int fd, void *buf, size_t len) {
     return 1;
 }
 
-/// @brief Sends a JSON message with a payload to a file descriptor.
-/// @param fd The file descriptor to which to send the message.
-/// @param type The type of the message.
-/// @param payload The JSON payload of the message.
-/// @return 1 if successful, 0 otherwise.
 int remocom_send_json_with_payload(int fd, const char *type, cJSON *payload) {
     cJSON *msg = cJSON_CreateObject();
     if (msg == NULL) {
@@ -333,11 +294,6 @@ int remocom_send_json_with_payload(int fd, const char *type, cJSON *payload) {
     return ok;
 }
 
-/// @brief Sends a JSON message with a string payload to a file descriptor.
-/// @param fd The file descriptor to which to send the message.
-/// @param type The type of the message.
-/// @param payload The string payload of the message.
-/// @return 1 if successful, 0 otherwise.
 int remocom_send_json_message(int fd, const char *type, const char *payload) {
     cJSON *payload_value = cJSON_CreateString(payload != NULL ? payload : "");
     if (payload_value == NULL) {
@@ -347,9 +303,6 @@ int remocom_send_json_message(int fd, const char *type, const char *payload) {
     return remocom_send_json_with_payload(fd, type, payload_value);
 }
 
-/// @brief Receives a JSON message from a file descriptor.
-/// @param fd The file descriptor from which to receive the message.
-/// @return The parsed JSON message, or NULL if an error occurred.
 cJSON *remocom_recv_json_message(int fd) {
     uint32_t network_len = 0;
     if (!remocom_recv_all(fd, &network_len, sizeof(network_len))) {
@@ -378,10 +331,6 @@ cJSON *remocom_recv_json_message(int fd) {
     return msg;
 }
 
-/// @brief Gets the size of a file at a given path.
-/// @param path The path to the file.
-/// @param size_out A pointer to a uint64_t where the size will be stored.
-/// @return 1 if successful, 0 otherwise.
 int remocom_get_file_size(const char *path, uint64_t *size_out) {
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
@@ -392,10 +341,6 @@ int remocom_get_file_size(const char *path, uint64_t *size_out) {
     return 1;
 }
 
-/// @brief Sends the contents of a file at a given path to a file descriptor as a stream.
-/// @param fd The file descriptor to which to send the file contents.
-/// @param path The path to the file.
-/// @return 1 if successful, 0 otherwise.
 int remocom_send_file_stream(int fd, const char *path) {
     FILE *file = fopen(path, "rb");
     if (file == NULL) {
@@ -421,11 +366,6 @@ int remocom_send_file_stream(int fd, const char *path) {
     return ok;
 }
 
-/// @brief Receives a file stream from a file descriptor and writes it to a file at a given path.
-/// @param fd The file descriptor from which to receive the stream.
-/// @param path The path to the file where the stream will be written.
-/// @param size The size of the stream to receive.
-/// @return 1 if successful, 0 otherwise.
 int remocom_recv_file_stream(int fd, const char *path, uint64_t size) {
     if (!remocom_ensure_parent_dirs(path)) {
         remocom_discard_stream(fd, size);
