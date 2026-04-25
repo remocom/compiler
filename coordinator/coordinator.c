@@ -160,13 +160,14 @@ static int build_compile_tasks_from_manifest(
 /// @brief Prints coordinator usage help.
 /// @param program_name argv[0] executable name.
 static void print_usage(const char *program_name) {
-    printf("Usage: %s --manifest <manifest.toml> [--keep-objects]\n", program_name);
-    printf("   or: %s -m <manifest.toml> [--keep-objects]\n", program_name);
+    printf("Usage: %s --manifest <manifest.toml> [--keep-objects] [--allow-external-workers]\n", program_name);
+    printf("   or: %s -m <manifest.toml> [--keep-objects] [--allow-external-workers]\n", program_name);
     printf("\n");
     printf("Options:\n");
-    printf("  -m, --manifest <manifest.toml>  Build manifest to coordinate\n");
-    printf("      --keep-objects              Retain object files after a successful link\n");
-    printf("  -h, --help                      Show this help text\n");
+    printf("  -m, --manifest <manifest.toml>   Build manifest to coordinate\n");
+    printf("      --keep-objects               Retain object files after a successful link\n");
+    printf("      --allow-external-workers     Listen on all network interfaces\n");
+    printf("  -h, --help                       Show this help text\n");
 }
 
 /// @brief Parses coordinator CLI args to find manifest path.
@@ -174,10 +175,18 @@ static void print_usage(const char *program_name) {
 /// @param argv Argument list.
 /// @param manifest_path Receives parsed manifest path.
 /// @param keep_objects_flag Receives whether object files should be retained.
+/// @param allow_external_workers Receives whether the coordinator should accept external workers.
 /// @return 1 when CLI args are valid and manifest is provided, 0 otherwise.
-static int parse_manifest_cli_flag(int argc, char **argv, const char **manifest_path, int *keep_objects_flag) {
+static int parse_manifest_cli_flag(
+    int argc,
+    char **argv,
+    const char **manifest_path,
+    int *keep_objects_flag,
+    int *allow_external_workers
+) {
     *manifest_path = NULL;
     *keep_objects_flag = 0;
+    *allow_external_workers = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--manifest") == 0 || strcmp(argv[i], "-m") == 0) {
@@ -189,6 +198,8 @@ static int parse_manifest_cli_flag(int argc, char **argv, const char **manifest_
             i++;
         } else if (strcmp(argv[i], "--keep-objects") == 0) {
             *keep_objects_flag = 1;
+        } else if (strcmp(argv[i], "--allow-external-workers") == 0) {
+            *allow_external_workers = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -504,8 +515,9 @@ static int spawn_worker_thread(int *client_fd_ptr) {
 }
 
 /// @brief Creates, binds, and listens on the coordinator server socket.
+/// @param allow_external_workers Bind to all interfaces when nonzero, otherwise loopback only.
 /// @return Server socket file descriptor.
-static int create_server_socket(void) {
+static int create_server_socket(int allow_external_workers) {
     // this creates the server or "phone" by using AF_INET (IPv4) and SOCK_STREAM (TCP)
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -517,7 +529,7 @@ static int create_server_socket(void) {
     memset(&server_addr, 0, sizeof(server_addr));
     // Set up the server address info (defines where the server lives)
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_addr.s_addr = htonl(allow_external_workers ? INADDR_ANY : INADDR_LOOPBACK);
     server_addr.sin_port = htons(PORT); // port == a "channel" people connect to
 
     // bind is saying "hey OS, i want to use port 5000"
@@ -603,8 +615,9 @@ static void *handle_worker(void *arg) {
 int main(int argc, char **argv) {
     const char *manifest_path = NULL;
     char manifest_error[256];
+    int allow_external_workers = 0;
 
-    if (!parse_manifest_cli_flag(argc, argv, &manifest_path, &keep_objects)) {
+    if (!parse_manifest_cli_flag(argc, argv, &manifest_path, &keep_objects, &allow_external_workers)) {
         print_usage(argv[0]);
         return 1;
     }
@@ -642,15 +655,18 @@ int main(int argc, char **argv) {
     log_event("MANIFEST LOADED | output=%s | sources=%d | headers=%d | flags=%d\n",
         build_manifest.output, build_manifest.source_count, build_manifest.header_count, build_manifest.flag_count);
     log_event("OBJECT RETENTION | keep_objects=%s\n", keep_objects ? "true" : "false");
+    log_event("NETWORK BIND | address=%s | port=%d\n",
+        allow_external_workers ? "0.0.0.0" : "127.0.0.1", PORT);
 
-    server_fd = create_server_socket();
+    server_fd = create_server_socket(allow_external_workers);
 
     // Create thread that will monitor heartbeat status of nodes.
     pthread_t monitor_thread;
     pthread_create(&monitor_thread, NULL, remocom_worker_registry_monitor, NULL);
     pthread_detach(monitor_thread);
 
-    printf("Coordinator listening on port %d\n", PORT);
+    printf("Coordinator listening on %s:%d\n",
+        allow_external_workers ? "0.0.0.0" : "127.0.0.1", PORT);
     printf("Loaded %d compile tasks for output '%s'\n", total_tasks, build_manifest.output);
 
     // Keep the coordinator running so workers can connect (keeps server alive forever. without this it would only accept one connection and exit)
