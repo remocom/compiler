@@ -136,6 +136,6 @@ Another limitation is that the coordinator is centralized. This makes the system
 A lesson learned from this project is that distributed systems require more than just sending messages between machines. We also had to think about worker state, timing, task assignment, logging, and how to safely handle multiple workers at the same time. Adding threads helped workers run independently, but it also added more complexity because shared data must be handled carefully.
 
 ## Additional Documentation
-TODO: Provide links to additional documentation that may exist in the repo, e.g.,
-* Sprint reports
-* User links
+Additional project documentation can be found in the `docs/` folder:
+
+- `docs/ProjectProposalTemplate (1).pdf` → contains the original project proposal, including goals, design ideas, and planned system architecture
