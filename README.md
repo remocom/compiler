@@ -6,7 +6,7 @@
 - Mitchell Milander [contact](mailto:mitchell.milander@wsu.edu)
 
 ## Project summary
-A remote compiler that seeks to reduce program compilation time by coordinating with other machines in a distributed system.
+A remote compiler that reduces program compilation time by coordinating with other machines in a distributed system.
 
 ### Additional Information
 1) A central machine (“the coordinator”)
@@ -193,8 +193,12 @@ Another limitation is that the coordinator is centralized. This makes the system
 A lesson learned from this project is that distributed systems require more than just sending messages between machines. We also had to think about worker state, timing, task assignment, logging, and how to safely handle multiple workers at the same time. Adding threads helped workers run independently, but it also added more complexity because shared data must be handled carefully.
 
 ## Additional Documentation
+[Remocom Video](https://www.youtube.com/watch?v=kw-D3D5jdAY&feature=youtu.be) - Quick demo of running program.
+
+[Link](https://github.com/remocom/hello_remocom) to secondary repo, **hello_remocom**, which provides an example build manifest and source files to compile.
+
 Additional project documentation can be found in the `docs/` folder:
 
 - `docs/LICENSE.txt` → license statement
-- `docs/ProjectProposalTemplate (1).pdf` → contains the original project proposal, including goals, design ideas, and planned system architecture
+- `docs/ProjectProposal.pdf` → contains the original project proposal, including goals, design ideas, and planned system architecture
 - `docs/Testing` → contains screenshots of testing throughout the development process
