@@ -2,10 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <netdb.h>
 #include <stdarg.h>
 #include <sys/wait.h>
 #include <cjson/cJSON.h>
@@ -20,6 +20,7 @@
 #define WORKER_LOCAL_OBJECT_SIZE (WORKER_PATH_SIZE + 32)
 #define WORKER_STATUS_SIZE 512
 #define WORKER_COMPILER_OUTPUT_SIZE 2048
+#define DEFAULT_COORDINATOR_HOST "127.0.0.1"
 
 /// @brief Structure to hold the state of a task execution within the worker.
 typedef struct {
@@ -39,35 +40,85 @@ typedef struct {
     int task_dir_created;
 } WorkerTaskExecution;
 
-/// @brief Creates a new socket for the worker to communicate with the coordinator.
-/// @return The file descriptor for the created socket.
-static int create_worker_socket(void) {
-    // this creates the worker "phone" socket using IPv4 + TCP
-    int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd < 0) {
-        perror("Socket failed");
-        exit(1);
+/// @brief Prints worker usage help.
+/// @param program_name argv[0] executable name.
+static void print_usage(const char *program_name) {
+    printf("Usage: %s [--coordinator <host-or-ip>]\n", program_name);
+    printf("\n");
+    printf("Options:\n");
+    printf("      --coordinator <host-or-ip>  Coordinator address to connect to (default: %s)\n",
+        DEFAULT_COORDINATOR_HOST);
+    printf("  -h, --help                      Show this help text\n");
+}
+
+/// @brief Parses worker CLI args.
+/// @param argc Argument count.
+/// @param argv Argument list.
+/// @param coordinator_host Receives parsed coordinator host.
+/// @return 1 when CLI args are valid, 0 otherwise.
+static int parse_worker_cli_args(int argc, char **argv, const char **coordinator_host) {
+    *coordinator_host = DEFAULT_COORDINATOR_HOST;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--coordinator") == 0) {
+            if (i + 1 >= argc) {
+                return 0;
+            }
+
+            *coordinator_host = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        } else {
+            return 0;
+        }
     }
 
-    return sock_fd;
+    return 1;
 }
 
 /// @brief Connects the worker socket to the coordinator.
-/// @param sock_fd The file descriptor for the worker socket.
-static void connect_to_coordinator(int sock_fd) {
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
+/// @param coordinator_host Hostname or IPv4 address of the coordinator.
+/// @return Connected socket file descriptor.
+static int connect_to_coordinator(const char *coordinator_host) {
+    struct addrinfo hints;
+    struct addrinfo *addresses = NULL;
+    struct addrinfo *address = NULL;
+    char port_str[16];
+    int sock_fd = -1;
 
-    // set up coordinator address (where the worker is dialing)
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
+    snprintf(port_str, sizeof(port_str), "%d", PORT);
 
-    if (connect(sock_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connect failed");
-        close(sock_fd);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int resolve_result = getaddrinfo(coordinator_host, port_str, &hints, &addresses);
+    if (resolve_result != 0) {
+        fprintf(stderr, "Failed to resolve coordinator '%s': %s\n",
+            coordinator_host, gai_strerror(resolve_result));
         exit(1);
     }
+
+    for (address = addresses; address != NULL; address = address->ai_next) {
+        sock_fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (sock_fd < 0) {
+            continue;
+        }
+
+        if (connect(sock_fd, address->ai_addr, address->ai_addrlen) == 0) {
+            freeaddrinfo(addresses);
+            return sock_fd;
+        }
+
+        close(sock_fd);
+        sock_fd = -1;
+    }
+
+    fprintf(stderr, "Connect failed for coordinator '%s': %s\n", coordinator_host, strerror(errno));
+    freeaddrinfo(addresses);
+    exit(1);
 }
 
 /// @brief Sends a JSON message with an arbitrary payload to the coordinator.
@@ -649,13 +700,18 @@ static void heartbeat_loop(int sock_fd) {
 
 /// @brief The main entry point for the worker process.
 /// @return The exit status of the program.
-int main(void) {
+int main(int argc, char **argv) {
     char buffer[BUFFER_SIZE];
-    int sock_fd = create_worker_socket();
+    const char *coordinator_host = NULL;
+
+    if (!parse_worker_cli_args(argc, argv, &coordinator_host)) {
+        print_usage(argv[0]);
+        return 1;
+    }
 
     // connect() == worker dials coordinator
-    connect_to_coordinator(sock_fd);
-    printf("Connected to coordinator\n");
+    int sock_fd = connect_to_coordinator(coordinator_host);
+    printf("Connected to coordinator at %s:%d\n", coordinator_host, PORT);
 
     // Perform handshake to verify compatibility with coordinator before proceeding.
     if (!perform_handshake(sock_fd, buffer)) {
