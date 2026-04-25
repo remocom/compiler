@@ -36,6 +36,7 @@ static int object_ready[MAX_TASKS];
 static int object_ready_count = 0;
 static int build_failed = 0;
 static int link_started = 0;
+static int keep_objects = 0;
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -159,17 +160,24 @@ static int build_compile_tasks_from_manifest(
 /// @brief Prints coordinator usage help.
 /// @param program_name argv[0] executable name.
 static void print_usage(const char *program_name) {
-    printf("Usage: %s --manifest <manifest.toml>\n", program_name);
-    printf("   or: %s -m <manifest.toml>\n", program_name);
+    printf("Usage: %s --manifest <manifest.toml> [--keep-objects]\n", program_name);
+    printf("   or: %s -m <manifest.toml> [--keep-objects]\n", program_name);
+    printf("\n");
+    printf("Options:\n");
+    printf("  -m, --manifest <manifest.toml>  Build manifest to coordinate\n");
+    printf("      --keep-objects              Retain object files after a successful link\n");
+    printf("  -h, --help                      Show this help text\n");
 }
 
 /// @brief Parses coordinator CLI args to find manifest path.
 /// @param argc Argument count.
 /// @param argv Argument list.
 /// @param manifest_path Receives parsed manifest path.
+/// @param keep_objects_flag Receives whether object files should be retained.
 /// @return 1 when CLI args are valid and manifest is provided, 0 otherwise.
-static int parse_manifest_cli_flag(int argc, char **argv, const char **manifest_path) {
+static int parse_manifest_cli_flag(int argc, char **argv, const char **manifest_path, int *keep_objects_flag) {
     *manifest_path = NULL;
+    *keep_objects_flag = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--manifest") == 0 || strcmp(argv[i], "-m") == 0) {
@@ -179,6 +187,8 @@ static int parse_manifest_cli_flag(int argc, char **argv, const char **manifest_
 
             *manifest_path = argv[i + 1];
             i++;
+        } else if (strcmp(argv[i], "--keep-objects") == 0) {
+            *keep_objects_flag = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -284,6 +294,7 @@ static void configure_linker_context(void) {
     linker_context.manifest = &build_manifest;
     linker_context.tasks = task_queue;
     linker_context.task_count = original_task_count;
+    linker_context.keep_objects = keep_objects;
     linker_context.log_message = log_task_dispatch_message;
     linker_context.callback_ctx = NULL;
 }
@@ -593,7 +604,7 @@ int main(int argc, char **argv) {
     const char *manifest_path = NULL;
     char manifest_error[256];
 
-    if (!parse_manifest_cli_flag(argc, argv, &manifest_path)) {
+    if (!parse_manifest_cli_flag(argc, argv, &manifest_path, &keep_objects)) {
         print_usage(argv[0]);
         return 1;
     }
@@ -630,6 +641,7 @@ int main(int argc, char **argv) {
 
     log_event("MANIFEST LOADED | output=%s | sources=%d | headers=%d | flags=%d\n",
         build_manifest.output, build_manifest.source_count, build_manifest.header_count, build_manifest.flag_count);
+    log_event("OBJECT RETENTION | keep_objects=%s\n", keep_objects ? "true" : "false");
 
     server_fd = create_server_socket();
 
