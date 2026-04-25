@@ -107,6 +107,24 @@ extern "C" int remocom_load_manifest_file(
                 return 0;
             }
         }
+
+        // Validate and copy local/project headers array if present.
+        if (build.contains("headers")) {
+            const std::vector<std::string> headers = toml::find<std::vector<std::string>>(build, "headers");
+            if (headers.size() > REMOCOM_MAX_HEADERS) {
+                std::snprintf(error_buf, error_buf_size,
+                    "Manifest error: [build].headers has too many entries (max %d)", REMOCOM_MAX_HEADERS);
+                return 0;
+            }
+
+            manifest->header_count = static_cast<int>(headers.size());
+            for (size_t i = 0; i < headers.size(); i++) {
+                if (!copy_string_to_buffer(headers[i], manifest->headers[i], REMOCOM_MAX_MANIFEST_VALUE,
+                    "headers", error_buf, error_buf_size)) {
+                    return 0;
+                }
+            }
+        }
     } catch (const std::exception &ex) {
         std::snprintf(error_buf, error_buf_size, "Manifest parse error: %s", ex.what());
         return 0;

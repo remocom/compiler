@@ -7,8 +7,16 @@
 #include <cjson/cJSON.h> // Ultra lightweight JSON parser library
 #include <time.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <sys/wait.h>
 #include "../common/common.h"
 #include "manifest_loader.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define PORT 5000
 #define BUFFER_SIZE 4096
@@ -16,9 +24,8 @@
 #define MAX_TASKS REMOCOM_MAX_SOURCES
 #define MAX_MANIFEST_VALUE REMOCOM_MAX_MANIFEST_VALUE
 #define MAX_FLAGS REMOCOM_MAX_FLAGS
-
-/// @brief Represents the status of a worker node, which can be either dead or alive.
-typedef enum { dead, alive } NodeStatus;
+#define MAX_TRANSFER_FILES (REMOCOM_MAX_HEADERS + 1)
+#define DEPENDENCY_OUTPUT_SIZE 65536
 
 /// @brief Represents a compile task derived from the manifest, containing source/object paths, build output, and flags.
 typedef struct {
@@ -28,6 +35,171 @@ typedef struct {
     char flags[MAX_FLAGS][MAX_MANIFEST_VALUE];
     int flag_count;
 } CompileTask;
+
+/// @brief Represents a file that needs to be transferred to a worker, including its path,
+/// kind (source or header), and size in bytes.
+typedef struct {
+    const char *path;
+    const char *kind;
+    uint64_t size;
+} TransferFile;
+
+/// @brief Adds a file to the list of files to be transferred.
+/// @param transfer_files Array of TransferFile structs being built for the current task assignment.
+/// @param transfer_paths Array of strings containing the paths of the files to be transferred.
+/// @param transfer_file_count Pointer to an integer representing the number of files in the transfer list.
+/// @param path The path of the file to be added.
+/// @param kind The kind of the file (source or header).
+/// @return 1 if successful, 0 otherwise.
+static int add_transfer_file(
+    TransferFile *transfer_files,
+    char transfer_paths[MAX_TRANSFER_FILES][MAX_MANIFEST_VALUE],
+    int *transfer_file_count,
+    const char *path,
+    const char *kind
+) {
+    for (int i = 0; i < *transfer_file_count; i++) {
+        if (strcmp(transfer_files[i].path, path) == 0) {
+            return 1;
+        }
+    }
+
+    if (*transfer_file_count >= MAX_TRANSFER_FILES) {
+        return 0;
+    }
+
+    snprintf(transfer_paths[*transfer_file_count], MAX_MANIFEST_VALUE, "%s", path);
+    transfer_files[*transfer_file_count].path = transfer_paths[*transfer_file_count];
+    transfer_files[*transfer_file_count].kind = kind;
+    transfer_files[*transfer_file_count].size = 0;
+    (*transfer_file_count)++;
+    return 1;
+}
+
+/// @brief Reads the output of a dependency scan from a file descriptor.
+/// @param read_fd The file descriptor from which to read the output.
+/// @param output A buffer to store the read output.
+/// @param output_size The size of the output buffer.
+/// @return 1 if successful, 0 otherwise.
+static int read_dependency_output(int read_fd, char *output, size_t output_size) {
+    size_t total = 0;
+
+    while (total + 1 < output_size) {
+        ssize_t n = read(read_fd, output + total, output_size - total - 1);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return 0;
+        }
+        if (n == 0) {
+            break;
+        }
+        total += (size_t)n;
+    }
+
+    output[total] = '\0';
+    return 1;
+}
+
+/// @brief Collects the source dependencies for a given compile task.
+/// @param task The compile task for which to collect dependencies.
+/// @param transfer_files Array of TransferFile structs being built for the current task assignment.
+/// @param transfer_paths Array of strings containing the paths of the files to be transferred.
+/// @param transfer_file_count Pointer to an integer representing the number of files
+/// in the transfer list.
+/// @param error_buf A buffer to store any error messages.
+/// @param error_buf_size The size of the error buffer.
+/// @return 1 if successful, 0 otherwise.
+static int collect_source_dependencies(
+    const CompileTask *task,
+    TransferFile *transfer_files,
+    char transfer_paths[MAX_TRANSFER_FILES][MAX_MANIFEST_VALUE],
+    int *transfer_file_count,
+    char *error_buf,
+    size_t error_buf_size
+) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        snprintf(error_buf, error_buf_size, "pipe() failed while scanning dependencies");
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        snprintf(error_buf, error_buf_size, "fork() failed while scanning dependencies");
+        return 0;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 || dup2(pipefd[1], STDERR_FILENO) < 0) {
+            close(pipefd[1]);
+            _exit(127);
+        }
+        close(pipefd[1]);
+
+        char *argv[MAX_FLAGS + 4];
+        int argc = 0;
+        argv[argc++] = "gcc";
+        for (int i = 0; i < task->flag_count; i++) {
+            argv[argc++] = (char *)task->flags[i];
+        }
+        argv[argc++] = "-MM";
+        argv[argc++] = (char *)task->source_path;
+        argv[argc] = NULL;
+
+        execvp("gcc", argv);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+
+    char output[DEPENDENCY_OUTPUT_SIZE];
+    int read_ok = read_dependency_output(pipefd[0], output, sizeof(output));
+    close(pipefd[0]);
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0 || !read_ok || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(error_buf, error_buf_size, "Dependency scan failed for %s: %s", task->source_path, output);
+        return 0;
+    }
+
+    char *deps = strchr(output, ':');
+    if (deps == NULL) {
+        snprintf(error_buf, error_buf_size, "Dependency scan output missing ':' for %s", task->source_path);
+        return 0;
+    }
+
+    deps++;
+    for (char *cursor = deps; *cursor != '\0'; cursor++) {
+        if (*cursor == '\\' && (cursor[1] == '\n' || cursor[1] == '\r')) {
+            *cursor = ' ';
+        }
+        if (*cursor == '\n' || *cursor == '\r' || *cursor == '\t') {
+            *cursor = ' ';
+        }
+    }
+
+    char *token = strtok(deps, " ");
+    while (token != NULL) {
+        if (token[0] != '\0' && strcmp(token, "\\") != 0) {
+            const char *kind = strcmp(token, task->source_path) == 0 ? "source" : "header";
+            if (!add_transfer_file(transfer_files, transfer_paths, transfer_file_count, token, kind)) {
+                snprintf(error_buf, error_buf_size, "Too many dependency files for %s", task->source_path);
+                return 0;
+            }
+        }
+        token = strtok(NULL, " ");
+    }
+
+    return 1;
+}
+
+/// @brief Represents the status of a worker node, which can be either dead or alive.
+typedef enum { dead, alive } NodeStatus;
 
 /// @brief Represents a worker node in the system, containing its ID, socket, IP address, last heartbeat timestamp, and status (alive or dead).
 typedef struct {
@@ -55,9 +227,48 @@ static pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void send_json_with_payload(int client_fd, const char *type_str, cJSON *payload);
 static void send_json_message(int client_fd, const char *type_str, const char *payload_str);
 static void *handle_worker(void *arg);
+
+static int change_to_manifest_directory(const char *manifest_path, char *error_buf, size_t error_buf_size) {
+    char manifest_copy[PATH_MAX];
+    snprintf(manifest_copy, sizeof(manifest_copy), "%s", manifest_path);
+
+    char *last_slash = strrchr(manifest_copy, '/');
+    if (last_slash == NULL) {
+        return 1;
+    }
+
+    if (last_slash == manifest_copy) {
+        last_slash[1] = '\0';
+    } else {
+        *last_slash = '\0';
+    }
+
+    if (chdir(manifest_copy) != 0) {
+        snprintf(error_buf, error_buf_size, "Failed to enter manifest directory '%s': %s",
+            manifest_copy, strerror(errno));
+        return 0;
+    }
+
+    return 1;
+}
+
+static int parse_u64_string(cJSON *value, uint64_t *out) {
+    if (!cJSON_IsString(value)) {
+        return 0;
+    }
+
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(value->valuestring, &end, 10);
+    if (errno != 0 || end == value->valuestring || *end != '\0') {
+        return 0;
+    }
+
+    *out = (uint64_t)parsed;
+    return 1;
+}
 
 /// @brief Builds a default object-file path from a source path.
 /// @param source_path Source path from manifest.
@@ -249,6 +460,12 @@ static void enqueue_for_reassign_unlocked(const CompileTask *task){
     }
 }
 
+static void requeue_task_for_prepare_failure(const CompileTask *task) {
+    pthread_mutex_lock(&task_mutex);
+    enqueue_for_reassign_unlocked(task);
+    pthread_mutex_unlock(&task_mutex);
+}
+
 /// @brief Assigns the next queued task to a worker or reports no-task.
 /// @param client_fd Worker socket.
 /// @param node_id Worker node ID for logging.
@@ -262,6 +479,48 @@ static void assign_task_to_worker(int client_fd, int node_id) {
         next_task_index++;
         pthread_mutex_unlock(&task_mutex);
 
+        TransferFile transfer_files[MAX_TRANSFER_FILES];
+        char transfer_paths[MAX_TRANSFER_FILES][MAX_MANIFEST_VALUE];
+        int transfer_file_count = 0;
+        char dependency_error[1024];
+
+        if (!add_transfer_file(transfer_files, transfer_paths, &transfer_file_count, task.source_path, "source")) {
+            log_event("[ERROR] Unable to queue source transfer | Node %d | Source: %s\n",
+                node_id, task.source_path);
+            requeue_task_for_prepare_failure(&task);
+            send_json_message(client_fd, "task_error", "Unable to queue source transfer");
+            return;
+        }
+
+        if (!collect_source_dependencies(&task, transfer_files, transfer_paths, &transfer_file_count,
+            dependency_error, sizeof(dependency_error))) {
+            log_event("[ERROR] %s\n", dependency_error);
+            requeue_task_for_prepare_failure(&task);
+            send_json_message(client_fd, "task_error", dependency_error);
+            return;
+        }
+
+        for (int i = 0; i < build_manifest.header_count; i++) {
+            if (!add_transfer_file(transfer_files, transfer_paths, &transfer_file_count,
+                build_manifest.headers[i], "header")) {
+                log_event("[ERROR] Too many transfer files for task | Node %d | Source: %s\n",
+                    node_id, task.source_path);
+                requeue_task_for_prepare_failure(&task);
+                send_json_message(client_fd, "task_error", "Too many transfer files");
+                return;
+            }
+        }
+
+        for (int i = 0; i < transfer_file_count; i++) {
+            if (!remocom_get_file_size(transfer_files[i].path, &transfer_files[i].size)) {
+                log_event("[ERROR] Transfer file unavailable for task | Node %d | File: %s\n",
+                    node_id, transfer_files[i].path);
+                requeue_task_for_prepare_failure(&task);
+                send_json_message(client_fd, "task_error", "Transfer file unavailable");
+                return;
+            }
+        }
+
         // Record ownership so we can re-enqueue if this worker dies
         pthread_mutex_lock(&workers_mutex);
         Node *worker = find_worker_by_socket_unlocked(client_fd);
@@ -271,18 +530,37 @@ static void assign_task_to_worker(int client_fd, int node_id) {
         }
         pthread_mutex_unlock(&workers_mutex);
 
-        // Build JSON payload for task assignment message.
         cJSON *payload = cJSON_CreateObject();
         cJSON_AddStringToObject(payload, "source", task.source_path);
         cJSON_AddStringToObject(payload, "object", task.object_path);
         cJSON_AddStringToObject(payload, "output", task.build_output);
+
+        cJSON *files = cJSON_AddArrayToObject(payload, "files");
+        for (int i = 0; i < transfer_file_count; i++) {
+            char size_text[32];
+            snprintf(size_text, sizeof(size_text), "%" PRIu64, transfer_files[i].size);
+
+            cJSON *file_payload = cJSON_CreateObject();
+            cJSON_AddStringToObject(file_payload, "path", transfer_files[i].path);
+            cJSON_AddStringToObject(file_payload, "kind", transfer_files[i].kind);
+            cJSON_AddStringToObject(file_payload, "size", size_text);
+            cJSON_AddItemToArray(files, file_payload);
+        }
 
         cJSON *flags = cJSON_AddArrayToObject(payload, "flags");
         for (int i = 0; i < task.flag_count; i++) {
             cJSON_AddItemToArray(flags, cJSON_CreateString(task.flags[i]));
         }
 
-        send_json_with_payload(client_fd, MSG_TYPE_TASK_ASSIGNMENT, payload);
+        int sent_ok = remocom_send_json_with_payload(client_fd, MSG_TYPE_TASK_ASSIGNMENT, payload);
+        for (int i = 0; sent_ok && i < transfer_file_count; i++) {
+            sent_ok = remocom_send_file_stream(client_fd, transfer_files[i].path);
+        }
+
+        if (!sent_ok) {
+            log_event("[ERROR] Failed sending source file to Node %d | Source: %s\n",
+                node_id, task.source_path);
+        }
         log_event("TASK ASSIGNED | Node %d | Source: %s | Object: %s\n",
             node_id, task.source_path, task.object_path);
         return;
@@ -295,7 +573,7 @@ static void assign_task_to_worker(int client_fd, int node_id) {
 /// @brief Logs compile task results reported by workers.
 /// @param node_id Worker node ID.
 /// @param payload Parsed task result payload.
-static void handle_task_result(int node_id, cJSON *payload) {
+static void handle_task_result(int client_fd, int node_id, cJSON *payload) {
     if (!cJSON_IsObject(payload)) {
         log_event("TASK RESULT | Node %d | Invalid payload\n", node_id);
         return;
@@ -309,12 +587,17 @@ static void handle_task_result(int node_id, cJSON *payload) {
     cJSON *exit_code = cJSON_GetObjectItem(payload, "exit_code");
     cJSON *message = cJSON_GetObjectItem(payload, "message");
     cJSON *output = cJSON_GetObjectItem(payload, "compiler_output");
+    cJSON *has_object = cJSON_GetObjectItem(payload, "has_object");
+    cJSON *object_size = cJSON_GetObjectItem(payload, "object_size");
 
     const char *source_str = cJSON_IsString(source) ? source->valuestring : "<unknown>";
     const char *object_str = cJSON_IsString(object) ? object->valuestring : "<unknown>";
     const char *status_str = cJSON_IsString(status) ? status->valuestring : "<unknown>";
     int exit_code_val = cJSON_IsNumber(exit_code) ? exit_code->valueint : -1;
     const char *message_str = cJSON_IsString(message) ? message->valuestring : "<none>";
+    int should_receive_object = cJSON_IsBool(has_object) && cJSON_IsTrue(has_object) && cJSON_IsString(object);
+    uint64_t object_size_val = 0;
+    int has_object_size = parse_u64_string(object_size, &object_size_val);
 
     log_event(
         "TASK RESULT | Node %d | source=%s | object=%s | status=%s | exit_code=%d | message=%s\n",
@@ -325,6 +608,23 @@ static void handle_task_result(int node_id, cJSON *payload) {
             node_id, source_str, output->valuestring);
         printf("\n\n--- compiler output (Node %d, source=%s, status=%s, exit_code=%d) ---\n%s--- end compiler output ---\n\n",
             node_id, source_str, status_str, exit_code_val, output->valuestring);
+    }
+
+    if (should_receive_object && has_object_size) {
+        if (remocom_recv_file_stream(client_fd, object_str, object_size_val)) {
+            log_event("OBJECT RECEIVED | Node %d | object=%s | bytes=%" PRIu64 "\n",
+                node_id, object_str, object_size_val);
+            printf("Object received from Node %d: %s (%" PRIu64 " bytes)\n",
+                node_id, object_str, object_size_val);
+        } else {
+            log_event("[ERROR] Failed receiving object file | Node %d | object=%s | bytes=%" PRIu64 "\n",
+                node_id, object_str, object_size_val);
+            printf("Failed receiving object from Node %d: %s (%" PRIu64 " bytes)\n",
+                node_id, object_str, object_size_val);
+        }
+    } else if (should_receive_object) {
+        log_event("[ERROR] Worker reported object without valid object_size | Node %d | object=%s\n",
+            node_id, object_str);
     }
 }
 
@@ -407,7 +707,7 @@ static void dispatch_worker_message(int client_fd, cJSON *type, cJSON *payload, 
     } else if (strcmp(type->valuestring, MSG_TYPE_TASK_REQUEST) == 0) {
         assign_task_to_worker(client_fd, node_id); // Assign next task or report no-task.
     } else if (strcmp(type->valuestring, MSG_TYPE_TASK_RESULT) == 0) {
-        handle_task_result(node_id, payload); // Log the task result reported by the worker.
+        handle_task_result(client_fd, node_id, payload); // Log the task result reported by the worker.
 
         // Worker finished this task - clear the active-task marker so it death
         // from now on doesn't trigger a task reassignment
@@ -606,31 +906,12 @@ static void *monitor_workers(void *arg) {
     return NULL;
 }
 
-/// @brief Sends a JSON message to a connected worker with any cJSON payload type.
-/// @param client_fd The socket file descriptor of the worker to send the message to.
-/// @param type_str The type of the JSON message.
-/// @param payload The payload object/value for the JSON message.
-static void send_json_with_payload(int client_fd, const char *type_str, cJSON *payload) {
-    cJSON *msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "type", type_str);
-    cJSON_AddItemToObject(msg, "payload", payload);
-
-    // Convert the cJSON object to a string and send it to the worker.
-    char *json_string = cJSON_PrintUnformatted(msg);
-    send(client_fd, json_string, strlen(json_string), 0);
-
-    // Deallocate memory used by cJSON object and string.
-    free(json_string);
-    cJSON_Delete(msg);
-}
-
 /// @brief Sends a JSON message to a connected worker.
 /// @param client_fd The socket file descriptor of the worker to send the message to.
 /// @param type_str The type of the JSON message.
 /// @param payload_str The payload of the JSON message.
 static void send_json_message(int client_fd, const char *type_str, const char *payload_str) {
-    cJSON *payload = cJSON_CreateString(payload_str != NULL ? payload_str : "");
-    send_json_with_payload(client_fd, type_str, payload);
+    remocom_send_json_message(client_fd, type_str, payload_str);
 }
 
 /// @brief Handles communication with a connected worker node, processing incoming JSON messages, updating worker status based on heartbeats, assigning tasks, and logging events. This function runs in a separate thread for each worker connection.
@@ -641,13 +922,10 @@ static void *handle_worker(void *arg) {
     int client_fd = *(int *)arg; //get the client socket passed from main thread
     free(arg); // free memory after grabbing value
 
-    char buffer[BUFFER_SIZE];
     printf("Helper handling worker\n");
 
-    int bytes = recv(client_fd, buffer, BUFFER_SIZE - 1, 0); //recv() == you listen / receive data
-    while (bytes > 0) { // connection stays alive as long as bytes are being read
-        buffer[bytes] = '\0';   // add string ending character to make sure its printable in C
-        cJSON *msg = cJSON_Parse(buffer);
+    cJSON *msg = remocom_recv_json_message(client_fd);
+    while (msg != NULL) { // connection stays alive as long as messages are being read
 
         // Check if the received message is valid JSON. If not, log and close.
         if (msg == NULL) {
@@ -677,13 +955,11 @@ static void *handle_worker(void *arg) {
             break;
         }
 
-        bytes = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+        msg = remocom_recv_json_message(client_fd);
     }
 
-    if (bytes == 0) {
+    if (!is_dead) {
         printf("Worker disconnected\n");
-    } else if (!is_dead) {
-        perror("Receive failed");
     }
 
     remove_worker_by_socket(client_fd);
@@ -707,6 +983,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (!change_to_manifest_directory(manifest_path, manifest_error, sizeof(manifest_error))) {
+        fprintf(stderr, "%s\n", manifest_error);
+        return 1;
+    }
+
     if (!build_compile_tasks_from_manifest(&build_manifest, manifest_error, sizeof(manifest_error))) {
         fprintf(stderr, "%s\n", manifest_error);
         return 1;
@@ -723,8 +1004,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    log_event("MANIFEST LOADED | output=%s | sources=%d | flags=%d\n",
-        build_manifest.output, build_manifest.source_count, build_manifest.flag_count);
+    log_event("MANIFEST LOADED | output=%s | sources=%d | headers=%d | flags=%d\n",
+        build_manifest.output, build_manifest.source_count, build_manifest.header_count, build_manifest.flag_count);
 
     server_fd = create_server_socket();
 

@@ -6,6 +6,7 @@
 #define REMOCOM_MAX_MANIFEST_VALUE 512
 #define REMOCOM_MAX_FLAGS 64
 #define REMOCOM_MAX_SOURCES 256
+#define REMOCOM_MAX_HEADERS 256
 
 typedef struct {
     char output[REMOCOM_MAX_MANIFEST_VALUE];
@@ -13,6 +14,8 @@ typedef struct {
     int flag_count;
     char sources[REMOCOM_MAX_SOURCES][REMOCOM_MAX_MANIFEST_VALUE];
     int source_count;
+    char headers[REMOCOM_MAX_HEADERS][REMOCOM_MAX_MANIFEST_VALUE];
+    int header_count;
 } BuildManifest;
 
 #ifdef __cplusplus

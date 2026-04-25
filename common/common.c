@@ -1,5 +1,63 @@
 #include "common.h"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
+#define REMOCOM_IO_CHUNK_SIZE 65536
+
+/// @brief Ensures that all parent directories of a given path exist, creating them if necessary.
+/// @param path The path for which to ensure parent directories exist.
+/// @return 1 if successful, 0 otherwise.
+static int remocom_ensure_parent_dirs(const char *path) {
+    char temp[1024];
+    snprintf(temp, sizeof(temp), "%s", path);
+
+    // Iterate through the path and create directories as needed.
+    for (char *cursor = temp + 1; *cursor != '\0'; cursor++) {
+        if (*cursor != '/') {
+            continue;
+        }
+
+        // Temporarily terminate the string to get the parent directory path.
+        // If the directory already exists, mkdir will fail with EEXIST, which we can ignore.
+        *cursor = '\0';
+        if (mkdir(temp, 0700) != 0 && errno != EEXIST) {
+            return 0;
+        }
+        *cursor = '/';
+    }
+
+    return 1;
+}
+
+/// @brief Discards a specified number of bytes from a stream, reading and ignoring the data.
+/// @param fd The file descriptor of the stream from which to discard data.
+/// @param size The number of bytes to discard.
+/// @return 1 if successful, 0 otherwise.
+static int remocom_discard_stream(int fd, uint64_t size) {
+    unsigned char buffer[REMOCOM_IO_CHUNK_SIZE];
+    uint64_t remaining = size;
+
+    while (remaining > 0) {
+        size_t chunk_size = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
+
+        // Read and discard the data from the stream. If any read operation fails, return 0.
+        if (!remocom_recv_all(fd, buffer, chunk_size)) {
+            return 0;
+        }
+        remaining -= chunk_size;
+    }
+
+    return 1;
+}
+
+/// @brief Detects the target architecture at compile time and returns it as a string.
+/// @return A pointer to the string representing the target architecture.
 const char *remocom_detect_target_arch(void) {
 #if defined(__x86_64__) || defined(_M_X64)
     return "x86_64";
@@ -14,6 +72,8 @@ const char *remocom_detect_target_arch(void) {
 #endif
 }
 
+/// @brief Detects the target operating system at compile time and returns it as a string.
+/// @return A pointer to the string representing the target operating system.
 const char *remocom_detect_target_os(void) {
 #if defined(__linux__)
     return "linux";
@@ -24,4 +84,223 @@ const char *remocom_detect_target_os(void) {
 #else
     return "unknown";
 #endif
+}
+
+/// @brief Sends all data from a buffer to a file descriptor.
+/// @param fd The file descriptor to which to send data.
+/// @param buf The buffer containing the data to send.
+/// @param len The number of bytes to send.
+/// @return 1 if successful, 0 otherwise.
+int remocom_send_all(int fd, const void *buf, size_t len) {
+    const unsigned char *cursor = (const unsigned char *)buf;
+    size_t sent = 0;
+
+    while (sent < len) {
+        ssize_t n = send(fd, cursor + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue; // Retry if send was interrupted by a signal.
+            }
+            return 0;
+        }
+        if (n == 0) {
+            return 0; // Connection closed by the peer.
+        }
+        sent += (size_t)n;
+    }
+
+    return 1;
+}
+
+/// @brief Receives all data from a file descriptor into a buffer.
+/// @param fd The file descriptor from which to receive data.
+/// @param buf The buffer into which to receive data.
+/// @param len The number of bytes to receive.
+/// @return 1 if successful, 0 otherwise.
+int remocom_recv_all(int fd, void *buf, size_t len) {
+    unsigned char *cursor = (unsigned char *)buf;
+    size_t received = 0;
+
+    while (received < len) {
+        ssize_t n = recv(fd, cursor + received, len - received, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue; // Retry if recv was interrupted by a signal.
+            }
+            return 0;
+        }
+        if (n == 0) {
+            return 0; // Connection closed by the peer.
+        }
+        received += (size_t)n;
+    }
+
+    return 1;
+}
+
+/// @brief Sends a JSON message with a payload to a file descriptor.
+/// @param fd The file descriptor to which to send the message.
+/// @param type The type of the message.
+/// @param payload The JSON payload of the message.
+/// @return 1 if successful, 0 otherwise.
+int remocom_send_json_with_payload(int fd, const char *type, cJSON *payload) {
+    cJSON *msg = cJSON_CreateObject();
+    if (msg == NULL) {
+        cJSON_Delete(payload);
+        return 0;
+    }
+
+    cJSON_AddStringToObject(msg, "type", type);
+    cJSON_AddItemToObject(msg, "payload", payload);
+
+    char *json_string = cJSON_PrintUnformatted(msg);
+    cJSON_Delete(msg);
+    if (json_string == NULL) {
+        return 0;
+    }
+
+    size_t json_len = strlen(json_string);
+    if (json_len > UINT32_MAX) {
+        free(json_string);
+        return 0;
+    }
+
+    // Send the length of the JSON string in network byte order, followed by the JSON string itself.
+    uint32_t network_len = htonl((uint32_t)json_len);
+    int ok = remocom_send_all(fd, &network_len, sizeof(network_len)) &&
+        remocom_send_all(fd, json_string, json_len);
+
+    free(json_string);
+    return ok;
+}
+
+/// @brief Sends a JSON message with a string payload to a file descriptor.
+/// @param fd The file descriptor to which to send the message.
+/// @param type The type of the message.
+/// @param payload The string payload of the message.
+/// @return 1 if successful, 0 otherwise.
+int remocom_send_json_message(int fd, const char *type, const char *payload) {
+    cJSON *payload_value = cJSON_CreateString(payload != NULL ? payload : "");
+    if (payload_value == NULL) {
+        return 0;
+    }
+
+    return remocom_send_json_with_payload(fd, type, payload_value);
+}
+
+/// @brief Receives a JSON message from a file descriptor.
+/// @param fd The file descriptor from which to receive the message.
+/// @return The parsed JSON message, or NULL if an error occurred.
+cJSON *remocom_recv_json_message(int fd) {
+    uint32_t network_len = 0;
+    if (!remocom_recv_all(fd, &network_len, sizeof(network_len))) {
+        return NULL;
+    }
+
+    // Convert the length from network byte order to host byte order.
+    uint32_t json_len = ntohl(network_len);
+    if (json_len == 0) {
+        return NULL;
+    }
+
+    char *json_string = (char *)malloc((size_t)json_len + 1);
+    if (json_string == NULL) {
+        return NULL;
+    }
+
+    if (!remocom_recv_all(fd, json_string, json_len)) {
+        free(json_string);
+        return NULL;
+    }
+
+    json_string[json_len] = '\0';
+    cJSON *msg = cJSON_Parse(json_string);
+    free(json_string);
+    return msg;
+}
+
+/// @brief Gets the size of a file at a given path.
+/// @param path The path to the file.
+/// @param size_out A pointer to a uint64_t where the size will be stored.
+/// @return 1 if successful, 0 otherwise.
+int remocom_get_file_size(const char *path, uint64_t *size_out) {
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        return 0; // An error occurred or the path is not a regular file.
+    }
+
+    *size_out = (uint64_t)st.st_size;
+    return 1;
+}
+
+/// @brief Sends the contents of a file at a given path to a file descriptor as a stream.
+/// @param fd The file descriptor to which to send the file contents.
+/// @param path The path to the file.
+/// @return 1 if successful, 0 otherwise.
+int remocom_send_file_stream(int fd, const char *path) {
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return 0;
+    }
+
+    unsigned char buffer[REMOCOM_IO_CHUNK_SIZE];
+    int ok = 1;
+
+    while (!feof(file)) {
+        size_t n = fread(buffer, 1, sizeof(buffer), file);
+        if (n > 0 && !remocom_send_all(fd, buffer, n)) {
+            ok = 0;
+            break;
+        }
+        if (ferror(file)) {
+            ok = 0;
+            break;
+        }
+    }
+
+    fclose(file);
+    return ok;
+}
+
+/// @brief Receives a file stream from a file descriptor and writes it to a file at a given path.
+/// @param fd The file descriptor from which to receive the stream.
+/// @param path The path to the file where the stream will be written.
+/// @param size The size of the stream to receive.
+/// @return 1 if successful, 0 otherwise.
+int remocom_recv_file_stream(int fd, const char *path, uint64_t size) {
+    if (!remocom_ensure_parent_dirs(path)) {
+        remocom_discard_stream(fd, size);
+        return 0;
+    }
+
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) {
+        remocom_discard_stream(fd, size);
+        return 0;
+    }
+
+    unsigned char buffer[REMOCOM_IO_CHUNK_SIZE];
+    uint64_t remaining = size;
+    int ok = 1;
+
+    while (remaining > 0) {
+        size_t chunk_size = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
+        if (!remocom_recv_all(fd, buffer, chunk_size)) {
+            ok = 0;
+            break;
+        }
+
+        if (fwrite(buffer, 1, chunk_size, file) != chunk_size) {
+            ok = 0;
+            break;
+        }
+
+        remaining -= chunk_size;
+    }
+
+    if (fclose(file) != 0) {
+        ok = 0;
+    }
+
+    return ok;
 }
