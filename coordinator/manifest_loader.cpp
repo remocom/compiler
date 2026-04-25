@@ -33,12 +33,6 @@ static int copy_string_to_buffer(
     return 1;
 }
 
-/// @brief Loads a build manifest from a TOML file.
-/// @param manifest_path The path to the manifest file.
-/// @param manifest The manifest struct to populate.
-/// @param error_buf The buffer to store any error messages.
-/// @param error_buf_size The size of the error buffer.
-/// @return 1 on success, 0 otherwise.
 extern "C" int remocom_load_manifest_file(
     const char *manifest_path,
     BuildManifest *manifest,
@@ -105,6 +99,24 @@ extern "C" int remocom_load_manifest_file(
             if (!copy_string_to_buffer(sources[i], manifest->sources[i], REMOCOM_MAX_MANIFEST_VALUE,
                 "sources", error_buf, error_buf_size)) {
                 return 0;
+            }
+        }
+
+        // Validate and copy local/project headers array if present.
+        if (build.contains("headers")) {
+            const std::vector<std::string> headers = toml::find<std::vector<std::string>>(build, "headers");
+            if (headers.size() > REMOCOM_MAX_HEADERS) {
+                std::snprintf(error_buf, error_buf_size,
+                    "Manifest error: [build].headers has too many entries (max %d)", REMOCOM_MAX_HEADERS);
+                return 0;
+            }
+
+            manifest->header_count = static_cast<int>(headers.size());
+            for (size_t i = 0; i < headers.size(); i++) {
+                if (!copy_string_to_buffer(headers[i], manifest->headers[i], REMOCOM_MAX_MANIFEST_VALUE,
+                    "headers", error_buf, error_buf_size)) {
+                    return 0;
+                }
             }
         }
     } catch (const std::exception &ex) {
