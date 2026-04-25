@@ -200,5 +200,4 @@ A lesson learned from this project is that distributed systems require more than
 Additional project documentation can be found in the `docs/` folder:
 
 - `docs/LICENSE.txt` → license statement
-- `docs/ProjectProposal.pdf` → contains the original project proposal, including goals, design ideas, and planned system architecture
 - `docs/Testing` → contains screenshots of testing throughout the development process
