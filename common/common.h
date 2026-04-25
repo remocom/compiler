@@ -2,7 +2,11 @@
 #ifndef REMOCOM_COMMON_H
 #define REMOCOM_COMMON_H
 
-#define REMOCOM_RPC_PROTOCOL_VERSION 1
+#include <stdint.h>
+#include <stddef.h>
+#include <cjson/cJSON.h>
+
+#define REMOCOM_RPC_PROTOCOL_VERSION 2
 
 #define MSG_TYPE_HANDSHAKE "handshake"
 #define MSG_TYPE_HANDSHAKE_ACK "handshake_ack"
@@ -20,5 +24,14 @@
 
 const char *remocom_detect_target_arch(void);
 const char *remocom_detect_target_os(void);
+
+int remocom_send_all(int fd, const void *buf, size_t len);
+int remocom_recv_all(int fd, void *buf, size_t len);
+int remocom_send_json_with_payload(int fd, const char *type, cJSON *payload);
+int remocom_send_json_message(int fd, const char *type, const char *payload);
+cJSON *remocom_recv_json_message(int fd);
+int remocom_get_file_size(const char *path, uint64_t *size_out);
+int remocom_send_file_stream(int fd, const char *path);
+int remocom_recv_file_stream(int fd, const char *path, uint64_t size);
 
 #endif

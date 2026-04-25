@@ -3,6 +3,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <cjson/cJSON.h>
@@ -11,6 +15,8 @@
 #define PORT 5000
 #define BUFFER_SIZE 4096
 #define MAX_TASK_FLAGS 64
+#define DISCARD_BUFFER_SIZE 4096
+#define MAX_COMPILER_ARGS (MAX_TASK_FLAGS * 3 + 10)
 
 /// @brief Creates a new socket for the worker to communicate with the coordinator.
 /// @return The file descriptor for the created socket.
@@ -48,15 +54,7 @@ static void connect_to_coordinator(int sock_fd) {
 /// @param type The type of the message.
 /// @param payload The payload object/value to attach.
 static void send_json_with_payload(int sock_fd, const char *type, cJSON *payload) {
-    cJSON *msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "type", type);
-    cJSON_AddItemToObject(msg, "payload", payload);
-
-    char *json_string = cJSON_PrintUnformatted(msg);
-    send(sock_fd, json_string, strlen(json_string), 0);
-
-    cJSON_Delete(msg);
-    free(json_string);
+    remocom_send_json_with_payload(sock_fd, type, payload);
 }
 
 /// @brief Sends a JSON message to the coordinator.
@@ -64,43 +62,178 @@ static void send_json_with_payload(int sock_fd, const char *type, cJSON *payload
 /// @param type The type of the message.
 /// @param payload The payload of the message.
 static void send_json_message(int sock_fd, const char *type, const char *payload) {
-    cJSON *payload_value = cJSON_CreateString(payload != NULL ? payload : "");
-    send_json_with_payload(sock_fd, type, payload_value);
+    remocom_send_json_message(sock_fd, type, payload);
 }
 
 /// @brief Sends a handshake payload describing worker build/runtime compatibility.
 /// @param sock_fd The file descriptor for the coordinator socket.
 static void send_handshake_message(int sock_fd) {
-    cJSON *msg = cJSON_CreateObject();
     cJSON *payload = cJSON_CreateObject();
-
-    cJSON_AddStringToObject(msg, "type", MSG_TYPE_HANDSHAKE);
-    cJSON_AddItemToObject(msg, "payload", payload);
 
     cJSON_AddStringToObject(payload, HANDSHAKE_KEY_GCC_VERSION, __VERSION__);
     cJSON_AddStringToObject(payload, HANDSHAKE_KEY_TARGET_ARCH, remocom_detect_target_arch());
     cJSON_AddStringToObject(payload, HANDSHAKE_KEY_TARGET_OS, remocom_detect_target_os());
     cJSON_AddNumberToObject(payload, HANDSHAKE_KEY_RPC_PROTOCOL_VERSION, REMOCOM_RPC_PROTOCOL_VERSION);
 
-    // Convert JSON object into a string to be sent through the socket.
-    char *json_string = cJSON_PrintUnformatted(msg);
-    send(sock_fd, json_string, strlen(json_string), 0);
-
-    cJSON_Delete(msg);
-    free(json_string);
+    remocom_send_json_with_payload(sock_fd, MSG_TYPE_HANDSHAKE, payload);
 }
 
-/// @brief Receives data from the coordinator into a buffer and stores it in the buffer.
-/// @param sock_fd The file descriptor for the coordinator socket.
-/// @param buffer The buffer to receive data into.
-/// @return The number of bytes received.
-static int receive_into_buffer(int sock_fd, char *buffer) {
-    // recv() == listen / receive data from coordinator
-    int bytes = recv(sock_fd, buffer, BUFFER_SIZE - 1, 0);
-    if (bytes > 0) {
-        buffer[bytes] = '\0'; // add string ending character so C prints safely
+/// @brief Parses a JSON string into a uint64_t value.
+/// @param value The JSON string to parse.
+/// @param out A pointer to the uint64_t variable where the parsed value will be stored.
+/// @return 1 if successful, 0 otherwise.
+static int parse_u64_string(cJSON *value, uint64_t *out) {
+    if (!cJSON_IsString(value)) {
+        return 0;
     }
-    return bytes;
+
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(value->valuestring, &end, 10);
+    if (errno != 0 || end == value->valuestring || *end != '\0') {
+        return 0;
+    }
+
+    *out = (uint64_t)parsed;
+    return 1;
+}
+
+/// @brief Returns the relative path of a transfer file, removing leading slashes.
+/// @param path The absolute path of the transfer file.
+/// @return The relative path of the transfer file.
+static const char *relative_transfer_path(const char *path) {
+    while (*path == '/') {
+        path++;
+    }
+
+    return path;
+}
+
+/// @brief Constructs the full path for an include file within the task directory.
+/// @param task_dir The directory for the current task.
+/// @param include_path The path of the include file.
+/// @param out A buffer to store the constructed path.
+/// @param out_size The size of the output buffer.
+static void make_task_include_path(const char *task_dir, const char *include_path, char *out, size_t out_size) {
+    const char *relative_path = relative_transfer_path(include_path);
+    snprintf(out, out_size, "%s/%s", task_dir, relative_path);
+}
+
+/// @brief Recursively removes a directory and all its contents.
+/// @param path The path of the directory to remove.
+static void cleanup_tree(const char *path) {
+    DIR *dir = opendir(path);
+    if (dir == NULL) {
+        unlink(path);
+        return;
+    }
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char child_path[512];
+        snprintf(child_path, sizeof(child_path), "%s/%s", path, entry->d_name);
+        cleanup_tree(child_path);
+    }
+
+    closedir(dir);
+    rmdir(path);
+}
+
+/// @brief Discards a stream of a given size from a file descriptor.
+/// @param sock_fd The file descriptor from which to discard the stream.
+/// @param size The size of the stream to discard.
+/// @return 1 if successful, 0 otherwise.
+static int discard_stream(int sock_fd, uint64_t size) {
+    char discard_buffer[DISCARD_BUFFER_SIZE];
+    uint64_t remaining = size;
+
+    while (remaining > 0) {
+        size_t chunk_size = remaining < sizeof(discard_buffer) ? (size_t)remaining : sizeof(discard_buffer);
+        if (!remocom_recv_all(sock_fd, discard_buffer, chunk_size)) {
+            return 0;
+        }
+        remaining -= chunk_size;
+    }
+
+    return 1;
+}
+
+/// @brief Discards files from a task payload that the worker is not going to process.
+/// @param sock_fd The file descriptor from which to discard the files.
+/// @param files The array of files to discard.
+static void discard_task_files(int sock_fd, cJSON *files) {
+    if (!cJSON_IsArray(files)) {
+        return;
+    }
+
+    int file_count = cJSON_GetArraySize(files);
+    for (int i = 0; i < file_count; i++) {
+        cJSON *file_item = cJSON_GetArrayItem(files, i);
+        cJSON *size_json = cJSON_GetObjectItem(file_item, "size");
+        uint64_t file_size = 0;
+        if (parse_u64_string(size_json, &file_size)) {
+            discard_stream(sock_fd, file_size);
+        }
+    }
+}
+
+/// @brief Receives the files for a task from the coordinator.
+/// @param sock_fd The file descriptor from which to receive the files.
+/// @param files The array of files to receive.
+/// @param task_dir The directory for the current task.
+/// @param source_path The path of the source file.
+/// @param local_source A buffer to store the path of the local source file.
+/// @param local_source_size The size of the local source buffer.
+/// @param status_message A buffer to store any error messages.
+/// @param status_message_size The size of the status message buffer.
+/// @return 1 if successful, 0 otherwise.
+static int receive_task_files(int sock_fd, cJSON *files, const char *task_dir, const char *source_path,
+    char *local_source, size_t local_source_size, char *status_message, size_t status_message_size) {
+    if (!cJSON_IsArray(files)) {
+        snprintf(status_message, status_message_size, "Task payload missing files array");
+        return 0;
+    }
+
+    int ok = 1;
+    int file_count = cJSON_GetArraySize(files);
+    for (int i = 0; i < file_count; i++) {
+        cJSON *file_item = cJSON_GetArrayItem(files, i);
+        cJSON *path_json = cJSON_GetObjectItem(file_item, "path");
+        cJSON *size_json = cJSON_GetObjectItem(file_item, "size");
+        uint64_t file_size = 0;
+
+        if (!cJSON_IsObject(file_item) || !cJSON_IsString(path_json) ||
+            !parse_u64_string(size_json, &file_size)) {
+            snprintf(status_message, status_message_size, "Invalid file metadata in task payload");
+            return 0;
+        }
+
+        const char *relative_path = relative_transfer_path(path_json->valuestring);
+        char local_path[512];
+        snprintf(local_path, sizeof(local_path), "%s/%s", task_dir, relative_path);
+
+        if (!remocom_recv_file_stream(sock_fd, local_path, file_size)) {
+            if (ok) {
+                snprintf(status_message, status_message_size, "Failed receiving task file: %s", path_json->valuestring);
+            }
+            return 0;
+        }
+
+        if (strcmp(path_json->valuestring, source_path) == 0) {
+            snprintf(local_source, local_source_size, "%s", local_path);
+        }
+    }
+
+    if (ok && local_source[0] == '\0') {
+        snprintf(status_message, status_message_size, "Task files did not include source: %s", source_path);
+        return 0;
+    }
+
+    return ok;
 }
 
 /// @brief Performs compatibility handshake and returns 1 on success.
@@ -108,14 +241,10 @@ static int receive_into_buffer(int sock_fd, char *buffer) {
 /// @param buffer Reusable receive buffer.
 /// @return 1 if handshake accepted, 0 otherwise.
 static int perform_handshake(int sock_fd, char *buffer) {
+    (void)buffer;
     send_handshake_message(sock_fd);
 
-    int bytes = receive_into_buffer(sock_fd, buffer);
-    if (bytes <= 0) {
-        return 0;
-    }
-
-    cJSON *msg = cJSON_Parse(buffer);
+    cJSON *msg = remocom_recv_json_message(sock_fd);
     if (msg == NULL) {
         return 0;
     }
@@ -123,14 +252,16 @@ static int perform_handshake(int sock_fd, char *buffer) {
     cJSON *type = cJSON_GetObjectItem(msg, "type");
     int accepted = cJSON_IsString(type) && strcmp(type->valuestring, MSG_TYPE_HANDSHAKE_ACK) == 0;
 
-    cJSON_Delete(msg);
-
     if (!accepted) {
-        printf("Handshake failed: %s\n", buffer);
+        char *response = cJSON_PrintUnformatted(msg);
+        printf("Handshake failed: %s\n", response != NULL ? response : "<unprintable>");
+        free(response);
+        cJSON_Delete(msg);
         return 0;
     }
 
     printf("Handshake accepted by coordinator\n");
+    cJSON_Delete(msg);
     return 1;
 }
 
@@ -138,12 +269,16 @@ static int perform_handshake(int sock_fd, char *buffer) {
 /// @param sock_fd The file descriptor for the coordinator socket.
 /// @param buffer The buffer to receive data into.
 static void register_with_coordinator(int sock_fd, char *buffer) {
+    (void)buffer;
     // send initial register message so coordinator knows this worker joined
     send_json_message(sock_fd, "register", "Hello from worker");
 
-    int bytes = receive_into_buffer(sock_fd, buffer);
-    if (bytes > 0) {
-        printf("Received from coordinator: %s\n", buffer);
+    cJSON *msg = remocom_recv_json_message(sock_fd);
+    if (msg != NULL) {
+        char *response = cJSON_PrintUnformatted(msg);
+        printf("Received from coordinator: %s\n", response != NULL ? response : "<unprintable>");
+        free(response);
+        cJSON_Delete(msg);
     }
 }
 
@@ -202,6 +337,9 @@ static void read_from_pipe(int read_fd, char *compiler_output, size_t compiler_o
 /// @return 1 on successful compile, 0 on failure.
 static int run_compile_task(
     cJSON *payload,
+    const char *local_source,
+    const char *local_object,
+    const char *task_dir,
     char *source,
     size_t source_size,
     char *object,
@@ -225,7 +363,9 @@ static int run_compile_task(
     snprintf(source, source_size, "%s", source_json->valuestring);
     snprintf(object, object_size, "%s", object_json->valuestring);
 
-    char *argv[MAX_TASK_FLAGS + 7];
+    char *argv[MAX_COMPILER_ARGS];
+    char task_include_paths[MAX_TASK_FLAGS][512];
+    int task_include_count = 0;
     int argc = 0;
     argv[argc++] = "gcc";
 
@@ -244,13 +384,34 @@ static int run_compile_task(
             return 0;
         }
         argv[argc++] = flag->valuestring;
+
+        if (strcmp(flag->valuestring, "-I") == 0 && i + 1 < flag_count) {
+            cJSON *include_dir = cJSON_GetArrayItem(flags_json, i + 1);
+            if (cJSON_IsString(include_dir) && task_include_count < MAX_TASK_FLAGS) {
+                argv[argc++] = "-I";
+                make_task_include_path(task_dir, include_dir->valuestring,
+                    task_include_paths[task_include_count], sizeof(task_include_paths[task_include_count]));
+                argv[argc++] = task_include_paths[task_include_count];
+                task_include_count++;
+            }
+        } else if (strncmp(flag->valuestring, "-I", 2) == 0 && flag->valuestring[2] != '\0' &&
+            task_include_count < MAX_TASK_FLAGS) {
+            make_task_include_path(task_dir, flag->valuestring + 2,
+                task_include_paths[task_include_count], sizeof(task_include_paths[task_include_count]));
+            argv[argc++] = "-I";
+            argv[argc++] = task_include_paths[task_include_count];
+            task_include_count++;
+        }
     }
+
+    argv[argc++] = "-I";
+    argv[argc++] = (char *)task_dir;
 
     // Add source and object arguments.
     argv[argc++] = "-c";
-    argv[argc++] = source;
+    argv[argc++] = (char *)local_source;
     argv[argc++] = "-o";
-    argv[argc++] = object;
+    argv[argc++] = (char *)local_object;
     argv[argc] = NULL;
 
     /*
@@ -329,7 +490,16 @@ static int run_compile_task(
 /// @param message Human-readable task status message.
 /// @param output Captured stdout/stderr from the compiler process.
 static void send_task_result(int sock_fd, const char *source, const char *object, const char *status,
-    int exit_code, const char *message, const char *output) {
+    int exit_code, const char *message, const char *output, const char *local_object, int has_object) {
+    uint64_t object_size = 0;
+    if (has_object && !remocom_get_file_size(local_object, &object_size)) {
+        has_object = 0;
+        object_size = 0;
+    }
+
+    char object_size_text[32];
+    snprintf(object_size_text, sizeof(object_size_text), "%" PRIu64, object_size);
+
     cJSON *payload = cJSON_CreateObject();
     cJSON_AddStringToObject(payload, "source", source);
     cJSON_AddStringToObject(payload, "object", object);
@@ -337,8 +507,13 @@ static void send_task_result(int sock_fd, const char *source, const char *object
     cJSON_AddNumberToObject(payload, "exit_code", exit_code);
     cJSON_AddStringToObject(payload, "message", message);
     cJSON_AddStringToObject(payload, "compiler_output", output);
+    cJSON_AddBoolToObject(payload, "has_object", has_object);
+    cJSON_AddStringToObject(payload, "object_size", object_size_text);
 
     send_json_with_payload(sock_fd, MSG_TYPE_TASK_RESULT, payload);
+    if (has_object) {
+        remocom_send_file_stream(sock_fd, local_object);
+    }
 }
 
 /// @brief Requests one task from coordinator and processes it.
@@ -346,16 +521,12 @@ static void send_task_result(int sock_fd, const char *source, const char *object
 /// @param buffer Shared receive buffer.
 /// @return 1 if worker should continue requesting tasks, 0 otherwise.
 static int request_and_process_task(int sock_fd, char *buffer) {
+    (void)buffer;
     send_json_message(sock_fd, MSG_TYPE_TASK_REQUEST, "requesting work");
 
-    int bytes = receive_into_buffer(sock_fd, buffer);
-    if (bytes <= 0) {
-        return 0;
-    }
-
-    cJSON *msg = cJSON_Parse(buffer);
+    cJSON *msg = remocom_recv_json_message(sock_fd);
     if (msg == NULL) {
-        printf("Invalid task response: %s\n", buffer);
+        printf("Invalid task response\n");
         return 0;
     }
 
@@ -372,21 +543,63 @@ static int request_and_process_task(int sock_fd, char *buffer) {
         return 0;
     }
 
+    if (strcmp(type->valuestring, "task_error") == 0) {
+        char *response = cJSON_PrintUnformatted(payload);
+        printf("Coordinator could not prepare task: %s\n", response != NULL ? response : "<unprintable>");
+        free(response);
+        cJSON_Delete(msg);
+        return 0;
+    }
+
     // For task assignments, run the compile and report the result back to the coordinator.
     if (strcmp(type->valuestring, MSG_TYPE_TASK_ASSIGNMENT) == 0) {
         char source[512] = {0};
         char object[512] = {0};
+        char task_dir[] = "/tmp/remocom-worker-XXXXXX";
+        char local_source[512] = {0};
+        char local_object[512] = {0};
         char status_message[512] = {0};
         char compiler_output[2048] = {0}; // Could be larger but then a single JSON message could fill up fast. Future problem to handle.
         int exit_code = 1;
+        int success = 0;
 
-        int success = run_compile_task(payload, source, sizeof(source), object, sizeof(object),
-            status_message, sizeof(status_message), compiler_output, sizeof(compiler_output), &exit_code);
+        cJSON *source_json = cJSON_GetObjectItem(payload, "source");
+        cJSON *object_json = cJSON_GetObjectItem(payload, "object");
+        cJSON *files_json = cJSON_GetObjectItem(payload, "files");
+
+        if (cJSON_IsString(source_json)) {
+            snprintf(source, sizeof(source), "%s", source_json->valuestring);
+        }
+        if (cJSON_IsString(object_json)) {
+            snprintf(object, sizeof(object), "%s", object_json->valuestring);
+        }
+
+        if (!cJSON_IsString(source_json)) {
+            snprintf(status_message, sizeof(status_message), "Task payload missing source");
+            discard_task_files(sock_fd, files_json);
+        } else if (mkdtemp(task_dir) == NULL) {
+            snprintf(status_message, sizeof(status_message), "mkdtemp() failed");
+            discard_task_files(sock_fd, files_json);
+        } else {
+            snprintf(local_object, sizeof(local_object), "%s/output.o", task_dir);
+
+            if (!receive_task_files(sock_fd, files_json, task_dir, source_json->valuestring,
+                local_source, sizeof(local_source), status_message, sizeof(status_message))) {
+                success = 0;
+            } else {
+                success = run_compile_task(payload, local_source, local_object, task_dir, source, sizeof(source), object, sizeof(object),
+                    status_message, sizeof(status_message), compiler_output, sizeof(compiler_output), &exit_code);
+            }
+        }
 
         printf("Task completed: %s\n", status_message);
-        send_task_result(sock_fd, source, object, success ? "success" : "failure", exit_code, status_message, compiler_output);
+        send_task_result(sock_fd, source, object, success ? "success" : "failure", exit_code,
+            status_message, compiler_output, local_object, success);
+        cleanup_tree(task_dir);
     } else {
-        printf("Unexpected response from coordinator: %s\n", buffer);
+        char *response = cJSON_PrintUnformatted(msg);
+        printf("Unexpected response from coordinator: %s\n", response != NULL ? response : "<unprintable>");
+        free(response);
     }
 
     cJSON_Delete(msg);
