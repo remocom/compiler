@@ -72,7 +72,7 @@ sources = ["main.c", "common/common.c"]
 
 4) Workers request compilation tasks from the coordinator, run GCC with the manifest-provided flags, and report task results back to the coordinator.
 
-### 4 Themes Used
+### Themes Used
 - Network Programming
   - Project allows multiple devices to communicate over a network to accomplish the shared goal of compiling a program.
   - Coordinator and worker nodes communicate over TCP sockets.
